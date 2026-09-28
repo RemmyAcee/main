@@ -6,10 +6,12 @@ import type { UseVerificationReturn } from '../hooks/useVerification'
 import { ChainProofPanel } from '../components/ChainProofPanel'
 import { EventList } from '../components/EventList'
 import { ShareVerificationLink } from '../components/ShareVerificationLink'
+import { VerifierSetStatusPanel } from '../components/VerifierSetStatusPanel'
 import { shortHash } from '../utils'
 import { useA11yStage } from '../hooks/useA11y'
 import ProvenanceCard from '../provenance/ProvenanceCard'
 import type { ProvenanceRecord } from '../provenance/provenanceModel'
+import { RedactionPreview } from '../components/RedactionPreview'
 import { CONTRACT_NETWORK_PASSPHRASE } from '../stellar'
 import type { VerificationShareLinkInput } from '../verificationShareLink'
 
@@ -47,6 +49,8 @@ export function StudioView({ wallet, evidence, verification, provenanceRecord }:
 
   const { statusLabel, isBusy } = useA11yStage(stage)
   const isProving = stage === 'proving'
+  const revocationProofId =
+    events.find((event) => event.video_hash === verifyHash && event.proof_id)?.proof_id ?? null
 
   const shareLinkInput = useMemo((): VerificationShareLinkInput | null => {
     if (!proof?.videoHash || !proof.proofId || !proof.metadataHash || !CONTRACT_ID) return null
@@ -167,6 +171,15 @@ export function StudioView({ wallet, evidence, verification, provenanceRecord }:
           </div>
         </dl>
 
+        <RedactionPreview
+          proof={proof}
+          secrets={{
+            credentialSeed: credentialSeed || undefined,
+            nullifierSeed: nullifierSeed || undefined,
+            mediaObjectUrl: processedVideoUrl || undefined,
+          }}
+        />
+
         {processedVideoUrl ? (
           <a
             className="download-link"
@@ -237,7 +250,13 @@ export function StudioView({ wallet, evidence, verification, provenanceRecord }:
 
         <div className="rail-block">
           <h3>Chain Registry</h3>
-          <ChainProofPanel chainProof={chainProof} />
+          <ChainProofPanel
+            chainProof={chainProof}
+            proofId={revocationProofId}
+            sourceAddress={wallet || undefined}
+          />
+          <h4 style={{ marginTop: '1rem', fontSize: '0.8rem', color: 'var(--text-muted)' }}>Verifier Set Status</h4>
+          <VerifierSetStatusPanel />
           {provenanceRecord ? <ProvenanceCard provenance={provenanceRecord} /> : null}
         </div>
 
