@@ -3670,7 +3670,7 @@ fn validate_lineage(
 
 fn check_lineage_cycle(env: &Env, proof_id: &BytesN<32>, target: &BytesN<32>) -> bool {
     let mut visited = SorobanVec::new(env);
-    check_lineage_cycle_internal(env, proof_id, target, &mut visited)
+    check_lineage_cycle_internal(env, proof_id, target, &mut visited, 1)
 }
 
 fn check_lineage_cycle_internal(
@@ -3678,7 +3678,12 @@ fn check_lineage_cycle_internal(
     proof_id: &BytesN<32>,
     target: &BytesN<32>,
     visited: &mut SorobanVec<BytesN<32>>,
+    depth: u32,
 ) -> bool {
+    if depth > MAX_LINEAGE_DEPTH {
+        return false;
+    }
+
     if visited.iter().any(|v| v == *proof_id) {
         return false;
     }
@@ -3692,7 +3697,7 @@ fn check_lineage_cycle_internal(
     if env.storage().persistent().has(&lineage_key) {
         let lineage: LineageRecord = env.storage().persistent().get(&lineage_key).unwrap();
         for parent in lineage.parent_proof_ids.iter() {
-            if check_lineage_cycle_internal(env, &parent, target, visited) {
+            if check_lineage_cycle_internal(env, &parent, target, visited, depth + 1) {
                 return true;
             }
         }
