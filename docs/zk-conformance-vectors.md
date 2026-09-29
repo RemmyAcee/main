@@ -52,6 +52,26 @@ bytes of `HARPOCRATES_REVOCATION_V1`, i.e.
 byte-identical to `REVOCATION_DOMAIN_SEPARATOR` in the registry contract, and
 the Rust runner asserts that directly rather than through a case.
 
+### Domain-binding rejection vectors
+
+`domain_tag` binds a proof to an exact `(protocol, circuit version, network)`
+tuple, so it is not enough that *a* tag is present — it must be the tag for
+*this* deployment. The corpus isolates each component so a regression in any one
+is caught by name:
+
+| Case | Rejected because |
+| --- | --- |
+| `sw-neg-045-domain-wrong-protocol` | tag recomputed with a different protocol component |
+| `sw-neg-046-domain-wrong-circuit-version` | tag recomputed with a different circuit version (cross-version replay) |
+| `sw-neg-047-domain-wrong-network` | tag recomputed with a different network component (cross-network replay) |
+
+`generate_vectors.py` recomputes each tag as
+`SHA-256(protocol' || version' || network')` with exactly one component changed,
+so the value stays canonical and non-zero: the failure is a genuine
+`domain_mismatch`, not a framing or canonicity error. The revocation separator
+gets the equivalent treatment (`rv-neg-041-domain-off-by-one`, the V1 → V2
+version byte).
+
 ### Canonical check order
 
 The order is part of the contract — two layers that reject the same input for
@@ -212,6 +232,36 @@ sw-neg-020-credential-root-equals-modulus: expected 'non_canonical_field', got N
 
 The Rust runner collects **all** mismatches before asserting, so a systematic
 divergence shows as a list rather than one case at a time.
+
+## Constant-time comparisons
+
+Every layer compares protocol bindings (`domain_tag`, the revocation
+`domain_separator`, zero sentinels, half-padding) with a helper that folds all
+bytes into one accumulator instead of exiting on the first difference:
+
+| Layer | Helper |
+| --- | --- |
+| Python (`backend/verifier_inputs.py`) | `constant_time_equals` (`hmac.compare_digest`) |
+| Browser (`frontend/src/verifierInputs.ts`) | `constantTimeEquals` |
+| Soroban codec (`verifier_inputs.rs`) | `constant_time_eq` |
+
+The backend metrics token check (`/metrics`) uses `hmac.compare_digest` on both
+candidate headers, matching the existing register API key check.
+
+**Threat model.** Public-input bytes are not secret, so this is defense in
+depth: a caller probing the verifier boundary cannot learn how many leading
+bytes of an expected binding matched from rejection latency. The metrics token
+*is* a secret, where this closes a real timing oracle. Length is public and a
+length mismatch returns early.
+
+**Circuits are unchanged.** `Field ==` in Noir lowers to fixed arithmetic
+constraints and the set-membership predicate scans every slot, so circuit
+behaviour is already data-independent. No ACIR, verification key, or entry in
+`zk/browser.artifacts.manifest.json` changes.
+
+**Compatibility and rollback.** Accept/reject decisions and reject codes are
+identical, so the corpus needs no version bump and stored evidence is
+unaffected. Rolling back is a plain revert with no migration.
 
 ## Privacy
 
