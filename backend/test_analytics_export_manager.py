@@ -8,12 +8,12 @@ import json
 
 import pytest
 
-from backend.analytics.export_manager import (
+from analytics.export_manager import (
     EXPORT_POLICY_DEFAULT,
     ExportManager,
     ExportPolicy,
 )
-from backend.analytics.log_processor import (
+from analytics.log_processor import (
     LogEntry,
     LogProcessor,
     validate_log_export_safety,

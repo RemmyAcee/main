@@ -3,7 +3,7 @@ import time
 import os
 import re
 from datetime import datetime, timezone
-from logging_utils import log_structured
+from logging_utils import log_structured, sanitize_diagnostic_text
 import threading
 import traceback
 from pathlib import Path
@@ -23,6 +23,7 @@ from db import (
     fail_job,
     expire_queued_jobs,
     time_out_job,
+    mark_job_cancelled,
     release_job_writer,
     insert_proof_event,
     init_db,
@@ -51,6 +52,18 @@ if not LOGGER.handlers:
 LOGGER.setLevel(logging.INFO)
 
 WORKER_ID = f"worker-{os.getpid()}"
+
+def sanitize_exception_text(exc: BaseException) -> str:
+    """Render an exception as a bounded, secret-redacted single line."""
+    message = str(exc)
+    rendered = f"{type(exc).__name__}: {message}" if message else type(exc).__name__
+    return sanitize_diagnostic_text(rendered)
+
+
+def sanitize_traceback(exc: BaseException) -> str:
+    """Render a traceback with secrets redacted and bounded in size."""
+    return sanitize_diagnostic_text("".join(traceback.format_exception(exc)))
+
 
 
 class JobCancelledError(Exception):

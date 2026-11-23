@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from backend.analytics.redaction_policy_diff import (
+from analytics.redaction_policy_diff import (
     PolicyComparisonReport,
     RedactionPolicyRevision,
     build_synthetic_analytics_records,

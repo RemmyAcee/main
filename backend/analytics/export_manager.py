@@ -8,7 +8,7 @@ import os
 import re
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 try:
@@ -80,6 +80,9 @@ CONSENT_STATE_GRANTED = "granted"
 
 _SAFE_LABEL_RE = re.compile(r"[^A-Za-z0-9._-]")
 _SAFE_CLASS_RE = re.compile(r"[^a-z0-9_.-]")
+
+# Version stamped on deletion preview payloads so consumers can detect format changes.
+DELETION_PREVIEW_SCHEMA_VERSION = "analytics-deletion-preview-v1"
 
 
 class TenantAuthorizationError(PermissionError):
@@ -663,6 +666,7 @@ class ExportManager:
                 )
             except Exception:
                 return None, "analytics_store_unavailable", 0
+            consent_revision, consent_state = resolve_consent_state(entries_filtered)
             payload_bytes = len(serialized.encode("utf-8"))
             output_digest = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
             checksum = output_digest[:16]

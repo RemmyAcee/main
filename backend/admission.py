@@ -140,6 +140,16 @@ def admission_error_response(decision: AdmissionDecision):
     })
 
 
+class AdmissionRejectedError(Exception):
+    """Raised when admission control rejects a request for lack of capacity."""
+
+    def __init__(self, reason: str = "overloaded", status_code: int = 503, retry_after: int = 5):
+        super().__init__(f"admission rejected: {reason}")
+        self.reason = reason
+        self.status_code = status_code
+        self.retry_after = retry_after
+
+
 class AdmissionState(str, Enum):
     QUEUED = "queued"
     ACTIVE = "active"

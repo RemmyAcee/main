@@ -12,13 +12,13 @@ import json
 
 import pytest
 
-from backend.analytics.consent import (
+from analytics.consent import (
     ConsentDecision,
     ConsentManager,
     ConsentSource,
     ConsentStatus,
 )
-from backend.analytics.export_manager import (
+from analytics.export_manager import (
     CONSENT_STATE_GRANTED,
     EXCLUDED_SENSITIVE_CLASSES,
     MANIFEST_DIGEST_PREFIX,
@@ -31,7 +31,7 @@ from backend.analytics.export_manager import (
     is_sensitive_record_class,
     verify_tenant_export_manifest,
 )
-from backend.analytics.log_processor import LogEntry, LogProcessor
+from analytics.log_processor import LogEntry, LogProcessor
 
 
 def _safe_entry(
