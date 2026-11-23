@@ -97,8 +97,25 @@ def sanitize_exception(exc: BaseException) -> dict[str, Any]:
 def log_structured(logger: logging.Logger, level: int, event: dict[str, Any]) -> None:
     logger.log(
         level,
-        json.dumps(redact_sensitive(event), separators=(",", ":"), sort_keys=True),
+        json.dumps(
+            redact_sensitive(event),
+            separators=(",", ":"),
+            sort_keys=True,
+            default=_json_default,
+        ),
     )
+
+
+def _json_default(value: object) -> str:
+    """Serialise values that are not natively JSON serialisable."""
+    for attr in ("isoformat",):
+        method = getattr(value, attr, None)
+        if callable(method):
+            try:
+                return method()
+            except Exception:  # pragma: no cover - defensive
+                pass
+    return str(value)
 
 
 def _is_sensitive_key(key: object) -> bool:

@@ -12,6 +12,7 @@ graduated trust levels without breaking privacy guarantees.
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import hmac
 import json
@@ -130,6 +131,10 @@ class TimeAttestation:
     # binding digest. Absence keeps historical behavior (no binding declared).
     parent_statement_digest: str | None = None
     statement_binding_digest: str | None = None
+    # Canonical statement identifiers carried by the receipt envelope. They are
+    # optional so historical attestations keep round-tripping unchanged.
+    parent_statement_id: str | None = None
+    child_statement_id: str | None = None
 
 
 # ── Encoding ───────────────────────────────────────────────────────────────
@@ -154,6 +159,11 @@ def encode_time_attestation(attestation: TimeAttestation) -> dict[str, Any]:
         "protocol": attestation.protocol,
         "evidenceDigest": attestation.evidence_digest,
     }
+
+    if attestation.parent_statement_id is not None:
+        obj["parentStatementId"] = attestation.parent_statement_id
+    if attestation.child_statement_id is not None:
+        obj["childStatementId"] = attestation.child_statement_id
 
     if attestation.parent_statement_digest is not None or attestation.statement_binding_digest is not None:
         obj["statementBinding"] = {
@@ -279,6 +289,8 @@ def decode_time_attestation(obj: dict[str, Any]) -> TimeAttestation:
         version=obj["version"],
         protocol=obj["protocol"],
         evidence_digest=obj["evidenceDigest"],
+        parent_statement_id=obj.get("parentStatementId"),
+        child_statement_id=obj.get("childStatementId"),
         claimed_time=claimed_time,
         observed_time=observed_time,
         stellar_anchors=stellar_anchors,
@@ -298,7 +310,12 @@ def canonical_time_attestation_hash(attestation: TimeAttestation) -> str:
 
 # ── Validation ─────────────────────────────────────────────────────────────
 
-def validate_time_attestation(attestation: TimeAttestation, evidence_digest: str) -> list[str]:
+def validate_time_attestation(
+    attestation: TimeAttestation,
+    evidence_digest: str,
+    expected_parent_statement_id: str | None = None,
+    expected_child_statement_id: str | None = None,
+) -> list[str]:
     """
     Validate a time attestation envelope.
     
@@ -337,6 +354,20 @@ def validate_time_attestation(attestation: TimeAttestation, evidence_digest: str
                 errors.append(
                     "Statement binding: bindingDigest does not match canonical parent-child binding"
                 )
+
+    # Verify the caller's expected statement identifiers (fail-closed).
+    if expected_parent_statement_id is not None:
+        if attestation.parent_statement_id != expected_parent_statement_id:
+            errors.append(
+                "parent statement id mismatch: expected "
+                f"{expected_parent_statement_id}, got {attestation.parent_statement_id}"
+            )
+    if expected_child_statement_id is not None:
+        if attestation.child_statement_id != expected_child_statement_id:
+            errors.append(
+                "child statement id mismatch: expected "
+                f"{expected_child_statement_id}, got {attestation.child_statement_id}"
+            )
 
     current_time_ms = int(time.time() * 1000)
     
@@ -474,6 +505,8 @@ def create_time_attestation(
     claimed_time_ms: int | None = None,
     claimed_source_label: str = "device_clock",
     uncertainty_ms: int = 0,
+    parent_statement_id: str | None = None,
+    child_statement_id: str | None = None,
 ) -> TimeAttestation:
     """
     Create a new time attestation with observed time.
@@ -500,13 +533,23 @@ def create_time_attestation(
         source_label="backend_system_clock",
     )
     
-    return TimeAttestation(
+    attestation = TimeAttestation(
         version=1,
         protocol=PROFILE_ID,
         evidence_digest=evidence_digest,
         claimed_time=claimed_time,
         observed_time=observed_time,
+        parent_statement_id=parent_statement_id,
+        child_statement_id=child_statement_id,
     )
+    if parent_statement_id is not None:
+        bound = bind_statement(attestation, parent_statement_id)
+        attestation = dataclasses.replace(
+            bound,
+            parent_statement_id=parent_statement_id,
+            child_statement_id=child_statement_id,
+        )
+    return attestation
 
 
 def add_stellar_anchor(
@@ -796,6 +839,8 @@ def bind_statement(
         extensions=attestation.extensions,
         parent_statement_digest=parent_statement_digest,
         statement_binding_digest=binding,
+        parent_statement_id=attestation.parent_statement_id,
+        child_statement_id=attestation.child_statement_id,
     )
 
 
@@ -870,3 +915,30 @@ def _extract_extensions(obj: dict[str, Any]) -> dict[str, Any]:
             continue
         extensions[key] = value
     return extensions
+
+def validate_receipt_input(
+    attestation: TimeAttestation,
+    evidence_digest: str,
+    expected_parent_statement_id: str | None = None,
+    expected_child_statement_id: str | None = None,
+) -> dict[str, Any]:
+    """Build the signing-tool receipt input for an attestation.
+
+    Returns only the fields the signing tool owns the values for; signature and
+    envelope versioning stay with the frontend. Raises ``ValueError`` when the
+    supplied expectations conflict with the attestation.
+    """
+    errors = validate_time_attestation(
+        attestation,
+        evidence_digest,
+        expected_parent_statement_id=expected_parent_statement_id,
+        expected_child_statement_id=expected_child_statement_id,
+    )
+    if errors:
+        raise ValueError("; ".join(errors))
+
+    return {
+        "evidenceDigest": attestation.evidence_digest,
+        "parentStatementId": attestation.parent_statement_id,
+        "childStatementId": attestation.child_statement_id,
+    }

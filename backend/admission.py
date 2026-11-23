@@ -193,6 +193,50 @@ class AdmissionController:
         self._tickets: Dict[str, AdmissionTicket] = {}
         self._identity_tickets: Dict[str, List[str]] = {}
         self._semaphore = threading.Semaphore(max_concurrent)
+        # Per-identity temporary upload storage reservations, in bytes.
+        self._storage_reserved: Dict[str, int] = {}
+
+    def reserve_storage(self, identity: str, size: int) -> Tuple[bool, str]:
+        """Reserve temporary upload budget for *identity*.
+
+        Returns ``(True, "reserved")`` when the reservation fits within
+        ``max_temp_storage_per_identity`` (unbounded when it is ``None``), or
+        ``(False, reason)`` when the budget would be exceeded.
+        """
+        budget = self.max_temp_storage_per_identity
+        try:
+            requested = int(size)
+        except (TypeError, ValueError):
+            requested = 0
+        if requested < 0:
+            requested = 0
+        with self._lock:
+            current = self._storage_reserved.get(identity, 0)
+            if budget is not None and current + requested > budget:
+                return False, "storage_budget_exceeded"
+            self._storage_reserved[identity] = current + requested
+            return True, "reserved"
+
+    def release_storage(self, identity: str, size: int) -> None:
+        """Release a previously reserved temporary upload budget."""
+        try:
+            released = int(size)
+        except (TypeError, ValueError):
+            released = 0
+        if released < 0:
+            released = 0
+        with self._lock:
+            current = self._storage_reserved.get(identity, 0)
+            remaining = current - released
+            if remaining > 0:
+                self._storage_reserved[identity] = remaining
+            else:
+                self._storage_reserved.pop(identity, None)
+
+    def storage_reserved(self, identity: str) -> int:
+        """Return the bytes currently reserved for *identity*."""
+        with self._lock:
+            return self._storage_reserved.get(identity, 0)
 
     def create_ticket(self, identity: str) -> Optional[AdmissionTicket]:
         with self._lock:

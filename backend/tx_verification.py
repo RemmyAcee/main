@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 import base64
+import re
 from dataclasses import dataclass
+
+# Scientific notation such as ``1e5`` or ``2E+3`` is rejected as a proof id.
+_EXPONENT_RE = re.compile(r"^[+-]?\d+(?:\.\d+)?[eE][+-]?\d+$")
 from typing import Any
 
 @dataclass

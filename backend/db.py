@@ -1241,7 +1241,94 @@ def _cancelled_result(reason: str | None = None) -> dict[str, Any]:
     return {"cancelled": True, "reason": text}
 
 
-def enqueue_job(job_type: str, payload: dict[str, Any]) -> int:
+class TenantQueueLimitExceededError(Exception):
+    """Raised when a tenant has too many queued video jobs."""
+
+    def __init__(self, tenant_id: str, limit: int, queued_count: int, job_type: str):
+        super().__init__(
+            f"tenant {tenant_id} already has {queued_count} queued video job(s) "
+            f"(limit {limit}); cannot enqueue {job_type}"
+        )
+        self.tenant_id = tenant_id
+        self.limit = limit
+        self.queued_count = queued_count
+        self.job_type = job_type
+
+
+def _resolve_tenant_id(tenant_id: str | None, payload: dict[str, Any] | None) -> str:
+    """Resolve the tenant for a job from an explicit value or the payload."""
+    if isinstance(tenant_id, str) and tenant_id.strip():
+        return tenant_id.strip()
+    if isinstance(payload, dict):
+        value = payload.get("tenant_id")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return DEFAULT_TENANT_ID
+
+
+def max_queued_video_jobs_per_tenant() -> int:
+    """Per-tenant queue bound for expensive video jobs."""
+    raw = os.getenv("WORKER_MAX_QUEUED_VIDEO_JOBS_PER_TENANT")
+    if raw is None or not raw.strip():
+        return DEFAULT_MAX_QUEUED_VIDEO_JOBS_PER_TENANT
+    try:
+        value = int(raw)
+    except ValueError:
+        return DEFAULT_MAX_QUEUED_VIDEO_JOBS_PER_TENANT
+    return value if value > 0 else DEFAULT_MAX_QUEUED_VIDEO_JOBS_PER_TENANT
+
+
+def max_concurrent_video_jobs_per_tenant() -> int:
+    """Per-tenant concurrency bound for expensive video jobs."""
+    raw = os.getenv("WORKER_MAX_CONCURRENT_VIDEO_JOBS_PER_TENANT")
+    if raw is None or not raw.strip():
+        return DEFAULT_MAX_CONCURRENT_VIDEO_JOBS_PER_TENANT
+    try:
+        value = int(raw)
+    except ValueError:
+        return DEFAULT_MAX_CONCURRENT_VIDEO_JOBS_PER_TENANT
+    return value if value > 0 else DEFAULT_MAX_CONCURRENT_VIDEO_JOBS_PER_TENANT
+
+
+def count_tenant_video_jobs(tenant_id: str, status: str | None = None) -> int:
+    """Count a tenant's video jobs, optionally filtered by status."""
+    with _JOBS_LOCK:
+        return sum(
+            1
+            for job in _JOBS.values()
+            if job.get("tenant_id", DEFAULT_TENANT_ID) == tenant_id
+            and job.get("type") in EXPENSIVE_VIDEO_JOB_TYPES
+            and (status is None or job.get("status") == status)
+        )
+
+
+def get_tenant_video_job_counts() -> dict[str, dict[str, int]]:
+    """Return per-tenant pending/running counts for expensive video jobs."""
+    counts: dict[str, dict[str, int]] = {}
+    with _JOBS_LOCK:
+        for job in _JOBS.values():
+            if job.get("type") not in EXPENSIVE_VIDEO_JOB_TYPES:
+                continue
+            tenant = job.get("tenant_id", DEFAULT_TENANT_ID)
+            bucket = counts.setdefault(tenant, {"pending": 0, "running": 0})
+            status = job.get("status")
+            if status == "pending":
+                bucket["pending"] += 1
+            elif status == "running":
+                bucket["running"] += 1
+    return counts
+
+
+def enqueue_job(
+    job_type: str,
+    payload: dict[str, Any],
+    *,
+    tenant_id: str | None = None,
+    deadline_at: datetime | None = None,
+    deadline_seconds: float | None = None,
+    now: datetime | None = None,
+    max_queued_per_tenant: int | None = None,
+) -> int:
     """Enqueue a background job and return its job id."""
     global _next_job_id
     resolved_tenant = _resolve_tenant_id(tenant_id, payload)
@@ -1471,6 +1558,8 @@ def lease_job(
         chosen["leased_at"] = current_iso
         chosen["heartbeat_at"] = current_iso
         chosen["lease_duration_seconds"] = lease_seconds
+        # Every lease invalidates results from an earlier claim on this job.
+        chosen["_claim_generation"] = chosen.get("_claim_generation", 0) + 1
         chosen.pop("processing_state", None)
         # Execution timeout is measured from the lease.
         chosen["_started_at"] = time.time()
