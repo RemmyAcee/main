@@ -12,11 +12,7 @@ async function sha256(input: ArrayBuffer | string) {
   return hex(await crypto.subtle.digest('SHA-256', bytes))
 }
 
-export async function fieldSecret(label: string, seed: string) {
-  const digest = await sha256(`harpocrates:${label}:${seed}`)
-  const value = BigInt(`0x${digest}`) % BN254_FIELD_MODULUS
-  return value === 0n ? '1' : value.toString(10)
-}
+export { fieldSecret } from './utils'
 
 /**
  * Derive a BN254 field element from a scope string.
@@ -65,15 +61,24 @@ export type SeedPair = {
   nullifierSeed: string
 }
 
+export class InvalidSeedError extends Error {}
+
 export function deriveSeeds(raw: SeedPair): SeedPair {
+  const cSeed = raw.credentialSeed.trim()
+  const nSeed = raw.nullifierSeed.trim()
+
+  if (cSeed.length > 256 || nSeed.length > 256) {
+    throw new InvalidSeedError('Seeds must be 256 characters or fewer')
+  }
+
   return {
-    credentialSeed: raw.credentialSeed.trim(),
-    nullifierSeed: raw.nullifierSeed.trim(),
+    credentialSeed: cSeed,
+    nullifierSeed: nSeed,
   }
 }
 
 export function hasSeeds(raw: SeedPair): boolean {
-  return raw.credentialSeed.trim().length > 0 && raw.nullifierSeed.trim().length > 0
+  return raw.credentialSeed.trim().length > 0 && raw.nullifierSeed.trim().length > 0 && raw.credentialSeed.trim().length <= 256 && raw.nullifierSeed.trim().length <= 256
 }
 
 export function createClearSeeds(setter: (value: string) => void): () => void {

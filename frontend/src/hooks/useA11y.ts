@@ -31,7 +31,7 @@ export function useLiveRegion() {
   return { message, announce }
 }
 
-export type Stage = 'idle' | 'hashing' | 'embedding' | 'proving' | 'ready' | 'registered' | 'error'
+export type Stage = 'idle' | 'hashing' | 'embedding' | 'proving' | 'ready' | 'registered' | 'error' | 'cancelled'
 
 const STAGE_LABELS: Record<Stage, string> = {
   idle: 'Ready',
@@ -39,12 +39,14 @@ const STAGE_LABELS: Record<Stage, string> = {
   embedding: 'Embedding metadata\u2026',
   proving: 'Generating proof\u2026',
   ready: 'Evidence package ready',
+  registering: 'Registering evidence\u2026',
   registered: 'Registration submitted',
   error: 'An error occurred',
+  cancelled: 'Cancelled',
 }
 
 export function useA11yStage(stage: Stage) {
-  const isBusy = stage === 'hashing' || stage === 'embedding' || stage === 'proving'
+  const isBusy = stage === 'hashing' || stage === 'embedding' || stage === 'proving' || stage === 'registering'
   const statusLabel = STAGE_LABELS[stage]
   return { statusLabel, isBusy }
 }
@@ -57,6 +59,54 @@ export function useFocusReturn(triggerRef: React.RefObject<HTMLElement | null>, 
     }
     prevShouldReturn.current = shouldReturn
   }, [shouldReturn, triggerRef])
+}
+
+/**
+ * Restores keyboard focus after an evidence stage changes.
+ *
+ * Focus moves only when the control the user was on did not survive the
+ * transition (it was removed or disabled), so progress updates never steal
+ * focus from a control that is still usable. The `ready` stage targets the next
+ * action control; every other stage targets the concise status heading, so
+ * assistive technology announces the stage instead of re-reading the page.
+ */
+export function useStageFocus(
+  stage: Stage,
+  statusTargetRef: React.RefObject<HTMLElement | null>,
+  nextActionRef?: React.RefObject<HTMLElement | null>,
+) {
+  const previousStageRef = useRef(stage)
+  const lastFocusedRef = useRef<HTMLElement | null>(null)
+
+  useEffect(() => {
+    const trackFocus = (event: FocusEvent) => {
+      if (event.target instanceof HTMLElement) lastFocusedRef.current = event.target
+    }
+    document.addEventListener('focusin', trackFocus)
+    return () => document.removeEventListener('focusin', trackFocus)
+  }, [])
+
+  useEffect(() => {
+    if (previousStageRef.current === stage) return
+    previousStageRef.current = stage
+
+    const previouslyFocused = lastFocusedRef.current
+    if (!previouslyFocused) return
+
+    const controlLost =
+      !previouslyFocused.isConnected ||
+      (previouslyFocused as HTMLButtonElement).disabled === true
+    if (!controlLost) return
+
+    const nextAction = nextActionRef?.current
+    const usableNextAction =
+      nextAction instanceof HTMLButtonElement && !nextAction.disabled ? nextAction : null
+    const target = stage === 'ready' && usableNextAction ? usableNextAction : statusTargetRef.current
+    if (!target) return
+
+    target.focus()
+    lastFocusedRef.current = target
+  }, [stage, statusTargetRef, nextActionRef])
 }
 
 export function useSkipLink() {

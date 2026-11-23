@@ -58,52 +58,52 @@
     {
       "component": "frontend",
       "path": "frontend/src/harpocratesRegistry.ts",
-      "sha256": "0e7089fcb861884bb60698c8e637a2a102ac1757478e759e9e497474277f3447"
+      "sha256": "a088df22e7417f7344abcbb364bfd95905860b27a808948d102a1f4a642902d7"
     },
     {
       "component": "frontend",
       "path": "frontend/src/releaseCompatibility.ts",
-      "sha256": "41b1b2f29348136d9b46a2c5698a44e741f774cf07d187aebd4eefee30fc5a15"
+      "sha256": "192c5fb475cab9d8e5e9b990e754e253cf36f176ca1c0611f2b6912c6f1c9141"
     },
     {
       "component": "backend",
       "path": "backend/app.py",
-      "sha256": "9e67d812d5d117d04f64283a3671a1b696e653d3857fb412aab75e31c6c40f0e"
+      "sha256": "29246a1474c6d49303c3a5424e21754a1b9b486bc95ed0e199e7e12eb4cdc841"
     },
     {
       "component": "backend",
       "path": "backend/config.py",
-      "sha256": "2471f22c3495fb54f932f046388fca6ef9a9ae0999b030c2c3dd2ab294fc58f3"
+      "sha256": "3329c54d560abd5135967d61ff4cfb5471439e2f2d9838028650b7c482b486e0"
     },
     {
       "component": "backend",
       "path": "backend/metrics.py",
-      "sha256": "bb00b949689750157496f292d8e290d219822b22bd7c0fac645967da1cde7359"
+      "sha256": "91b783def9be374c33921e3cd2c123a2fdb0ef111b2cf79f51020900686ebb87"
     },
     {
       "component": "circuit",
       "path": "zk/noir/silent_witness/Nargo.toml",
-      "sha256": "5409afc3bf8006190be0dc19392c3e28a5c36143791c9fef998e7da6227ce222"
+      "sha256": "10a5d3ecf6efb8ef39317231452986eddc17b97ce0bcba0031b3198c6478f763"
     },
     {
       "component": "circuit",
       "path": "zk/noir/silent_witness/src/main.nr",
-      "sha256": "9877a0775231019dbc2a86b57c521cadec5fcd20223c6bd5a300db7b301487b3"
+      "sha256": "e606a165bfa683da556cedfc32c3a4cc46baa051b50301934e2107a01cd3572c"
     },
     {
       "component": "verifier",
       "path": "release/verifier-binding.json",
-      "sha256": "e2a5d920e1ffa1ffa001acd4ccd3e3ef3a6a577452cc29b3f6b3c5897f922890"
+      "sha256": "a97a983ff63ccc08ec048e5217bdeb282607aa6e862e92b3f3594d37e30f128b"
     },
     {
       "component": "registry",
       "path": "contracts/contracts/harpocrates-registry/src/lib.rs",
-      "sha256": "5f171d399d4d644cb2fdf8b0a1cb98f106f24401464e9bd3fb86c5b85f60697d"
+      "sha256": "3242a909431f49952276cdd7faac9d4907f616a85222f1e9c97910c09a3b4342"
     },
     {
       "component": "registry",
       "path": "contracts/contracts/harpocrates-registry/Cargo.toml",
-      "sha256": "2094c0519287f8cc93af29a392bbe509024cf7beb3022b9d6c347e7f48b4f065"
+      "sha256": "ae94654ea843d7a7580156b2dfe5e83c091e75eb7af8d46a7d32f94b105a1183"
     }
   ]
 }

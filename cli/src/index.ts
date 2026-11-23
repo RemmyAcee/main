@@ -30,10 +30,20 @@ export {
   REQUIRED_EMBED_METADATA,
 } from './metadata.js'
 export type { HarpocratesMetadata, IdentityTier } from './metadata.js'
-export { createProofManifest, serializeManifest, parseManifest } from './manifest.js'
+export { createProofManifest, serializeManifest, parseManifest, readBoundedManifest, MAX_MANIFEST_BYTES } from './manifest.js'
 export type { ProofManifest, ManifestInput } from './manifest.js'
-export { lookupByVideoHash, verifyTransaction } from './stellar-lookup.js'
-export type { ChainProofRecord, StellarLookupOptions, TransactionVerification } from './stellar-lookup.js'
+export {
+  lookupByVideoHash,
+  lookupProofStatus,
+  normalizeProofStatus,
+  verifyTransaction,
+} from './stellar-lookup.js'
+export type {
+  ChainProofRecord,
+  ProofLifecycleStatus,
+  StellarLookupOptions,
+  TransactionVerification,
+} from './stellar-lookup.js'
 export { createReceipt, formatReceipt } from './receipt.js'
 export type { VerificationReceipt, VerificationResult } from './receipt.js'
 export { computeResult, networkName } from './normalize.js'
@@ -51,6 +61,7 @@ export type {
   ReceiptVerificationOptions,
   ReceiptVerificationResult,
 } from './signed-receipt.js'
+export { redactSensitive, logStructured, REDACTED_VALUE } from './logging.js'
 export {
   exportC2paAssertions,
   parseC2paReceiptInput,
@@ -58,3 +69,52 @@ export {
   c2paExportDigest,
 } from './c2pa.js'
 export type { C2paExport, C2paExportOptions, C2paAssertion } from './c2pa.js'
+export { getLineage, getProofStatus } from './stellar-lookup.js'
+export type { LineageRecord, ProofStatus } from './stellar-lookup.js'
+export {
+  verifyLineageTree,
+  formatLineageTree,
+  MAX_LINEAGE_DEPTH,
+  MAX_LINEAGE_FANOUT,
+} from './verify-lineage.js'
+export type { LineageNode, LineageTreeResult, LineageFetcher } from './verify-lineage.js'
+export { resolveNetwork, DEFAULT_NETWORK_PASSPHRASE } from './network.js'
+export {
+  parseTrustPolicy,
+  compareTrustPolicies,
+  formatTrustPolicyComparison,
+  runCompareTrustPolicy,
+  PolicyParseError,
+} from './compare-trust-policy.js'
+
+export type {
+  TrustPolicy,
+  ReceiptDecision,
+  ReceiptDiff,
+  ManifestDecision,
+  ManifestDiff,
+  TrustPolicyComparisonReport,
+  RunCompareTrustPolicyIo,
+} from './compare-trust-policy.js'
+
+export {
+  checkCompatibility,
+  formatCompatReport,
+  runCheckCompat,
+  COMPAT_EXIT_CODES,
+} from './compat.js'
+
+export {
+  compareReceipts,
+  formatComparisonResult,
+  parseReceiptInput,
+  normalizeReceipt,
+} from './compare-receipt.js'
+export type {
+  ReceiptCategory,
+  ReceiptDifference,
+  ReceiptComparisonResult,
+  NormalizedCanonicalStatement,
+  NormalizedTrustProperties,
+  NormalizedReceipt,
+} from './compare-receipt.js'

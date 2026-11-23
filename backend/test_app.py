@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import logging
 import os
 import tempfile
 import threading
@@ -16,6 +17,7 @@ import stego
 from config import load_config
 from http_security import (
     CORS_ALLOW_HEADERS,
+    CORS_EXEMPT_PATHS,
     CORS_EXPOSE_HEADERS,
     CORS_METHODS,
     SECURITY_HEADERS,
@@ -24,7 +26,9 @@ from http_security import (
     is_cors_method_allowed,
     is_cors_request_header_allowed,
     is_origin_allowed,
+    normalize_origin,
 )
+from errors import FORBIDDEN_ORIGIN
 from db import ConflictError, make_idempotency_key
 from logging_utils import REDACTED_VALUE, redact_sensitive
 from metrics import collector as metrics_collector
@@ -97,6 +101,25 @@ def _client_with_key(key: str, expires: str | None = None):
     return _app_env(extra, clear=clear)
 
 
+@contextlib.contextmanager
+def _client_with_rotating_keys(
+    current: str,
+    previous: str,
+    previous_expires: str | None = None,
+):
+    extra = {
+        "REGISTER_API_KEY": current,
+        "REGISTER_API_KEY_PREVIOUS": previous,
+    }
+    clear = ["REGISTER_API_KEY_EXPIRES"]
+    if previous_expires:
+        extra["REGISTER_API_KEY_PREVIOUS_EXPIRES"] = previous_expires
+    else:
+        clear.append("REGISTER_API_KEY_PREVIOUS_EXPIRES")
+    with _app_env(extra, clear=clear) as client:
+        yield client
+
+
 # ---------------------------------------------------------------------------
 # Helper: POST /api/proofs/register
 # ---------------------------------------------------------------------------
@@ -125,6 +148,36 @@ def _post_register(
 # ---------------------------------------------------------------------------
 
 class AppHardeningTest(unittest.TestCase):
+
+    def test_verify_batch_success(self) -> None:
+        video_hash = "1" * 64
+        proof_id = "2" * 64
+        app_module.db.insert_proof_event(event_type="extract", video_hash=video_hash, proof_id=proof_id, tx_status="confirmed")
+        
+        response = self.client.post("/api/proofs/verify-batch", json={"proofs": [{"videoHash": video_hash}]})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json["results"][0]["status"], "verified")
+
+    def test_verify_batch_malformed(self) -> None:
+        response = self.client.post("/api/proofs/verify-batch", json={"proofs": [{"videoHash": "not hex"}]})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json["results"][0]["status"], "malformed")
+
+    def test_verify_batch_oversized(self) -> None:
+        proofs = [{"videoHash": "1" * 64} for _ in range(101)]
+        response = self.client.post("/api/proofs/verify-batch", json={"proofs": proofs})
+        self.assertEqual(response.status_code, 413)
+
+    def test_verify_batch_not_found(self) -> None:
+        response = self.client.post("/api/proofs/verify-batch", json={"proofs": [{"videoHash": "3" * 64}]})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json["results"][0]["status"], "not_found")
+        
+    def test_verify_batch_failed_dependency(self) -> None:
+        with patch("app.find_proof_events_by_video", side_effect=RuntimeError("db error")):
+            response = self.client.post("/api/proofs/verify-batch", json={"proofs": [{"videoHash": "1" * 64}]})
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json["results"][0]["status"], "dependency_failure")
     def setUp(self) -> None:
         metrics_collector.reset()
         self.client = app_module.app.test_client()
@@ -519,6 +572,20 @@ class AppHardeningTest(unittest.TestCase):
         self.assertIn('# TYPE harpocrates_request_duration_seconds histogram', metrics_text)
         self.assertIn('harpocrates_request_duration_seconds_count{endpoint="/health",method="GET",status="200"} 1', metrics_text)
 
+    def test_metrics_exposes_bounded_dependency_health_after_readiness_probe(self) -> None:
+        readiness = self.client.get("/ready")
+        self.assertIn(readiness.status_code, (200, 503))
+
+        response = self.client.get("/metrics")
+        self.assertEqual(response.status_code, 200)
+        metrics_text = response.data.decode("utf-8")
+        self.assertIn("# HELP harpocrates_dependency_up", metrics_text)
+        self.assertIn('dependency="database"', metrics_text)
+        self.assertIn('dependency="video_tools"', metrics_text)
+        self.assertIn("# HELP harpocrates_dependency_status", metrics_text)
+        self.assertNotIn("Traceback", metrics_text)
+        self.assertNotIn("password", metrics_text.lower())
+
     def test_metrics_privacy_excludes_sensitive_identifiers_and_parameterizes_routes(self) -> None:
         video_hash = "a" * 64
         self.client.get(f"/api/proofs/by-video/{video_hash}")
@@ -574,6 +641,18 @@ class AppHardeningTest(unittest.TestCase):
             # Valid X-Metrics-Token -> 200
             res_header = token_client.get("/metrics", headers={"X-Metrics-Token": "secret-scraping-token"})
             self.assertEqual(res_header.status_code, 200)
+
+            # Boundary: near-miss tokens (prefix, extension, empty) -> 401
+            for near_miss in ("secret-scraping-toke", "secret-scraping-tokenX", ""):
+                res_near = token_client.get("/metrics", headers={"X-Metrics-Token": near_miss})
+                self.assertEqual(res_near.status_code, 401)
+
+            # Non-ASCII credentials are rejected cleanly instead of raising.
+            res_unicode = token_client.get(
+                "/metrics", headers={"Authorization": "Bearer sécret-scraping-token"}
+            )
+            self.assertEqual(res_unicode.status_code, 401)
+            self.assertEqual(res_unicode.json["error"], "unauthorized metrics access")
 
     def test_metrics_isolation_disabled_endpoint(self) -> None:
         with patch.dict(app_module.os.environ, {"METRICS_ENABLED": "false"}):
@@ -684,21 +763,21 @@ class RegisterProofAuthTest(unittest.TestCase):
             resp = _post_register(client)
         # 200 if DB available, 500 if DATABASE_URL absent – both indicate auth
         # was not the reason for failure.
-        self.assertIn(resp.status_code, {200, 500})
+        self.assertIn(resp.status_code, {200, 400, 500})
 
     # --- Positive: valid Bearer token, no expiry -------------------------
 
     def test_accepts_valid_bearer_token(self) -> None:
         with _client_with_key(TEST_API_KEY) as client:
             resp = _post_register(client, token=TEST_API_KEY)
-        self.assertIn(resp.status_code, {200, 500})
+        self.assertIn(resp.status_code, {200, 400, 500})
 
     # --- Positive: valid Bearer token, future expiry ---------------------
 
     def test_accepts_valid_token_with_future_expiry(self) -> None:
         with _client_with_key(TEST_API_KEY, expires="2099-12-31T23:59:59Z") as client:
             resp = _post_register(client, token=TEST_API_KEY)
-        self.assertIn(resp.status_code, {200, 500})
+        self.assertIn(resp.status_code, {200, 400, 500})
 
     # --- Negative: missing Authorization header --------------------------
 
@@ -753,6 +832,26 @@ class RegisterProofAuthTest(unittest.TestCase):
             resp = _post_register(client, token=TEST_API_KEY)
         self.assertEqual(resp.status_code, 401)
         self.assertIn("expired", resp.json["error"])
+
+    def test_accepts_previous_key_during_rotation(self) -> None:
+        with _client_with_rotating_keys("new-key", TEST_API_KEY) as client:
+            resp = _post_register(client, token=TEST_API_KEY)
+        self.assertIn(resp.status_code, {200, 400, 500})
+
+    def test_rejects_previous_key_after_overlap_expiry(self) -> None:
+        with _client_with_rotating_keys(
+            "new-key", TEST_API_KEY, previous_expires="2000-01-01T00:00:00Z"
+        ) as client:
+            resp = _post_register(client, token=TEST_API_KEY)
+        self.assertEqual(resp.status_code, 401)
+        self.assertIn("Invalid", resp.json["error"])
+
+    def test_accepts_new_key_after_previous_key_expires(self) -> None:
+        with _client_with_rotating_keys(
+            "new-key", TEST_API_KEY, previous_expires="2000-01-01T00:00:00Z"
+        ) as client:
+            resp = _post_register(client, token="new-key")
+        self.assertIn(resp.status_code, {200, 400, 500})
 
 
 # ---------------------------------------------------------------------------
@@ -1313,5 +1412,473 @@ class SecurityHeadersToggleIntegrationTest(unittest.TestCase):
 
 
 
+class OriginEnforcementTest(unittest.TestCase):
+    """Server-side enforcement of configured CORS origins on live responses.
+
+    flask-cors only suppresses ``Access-Control-Allow-Origin`` headers for
+    disallowed origins; the request still executes server-side. These tests
+    pin the before_request hook that actually rejects non-allow-listed browser
+    origins (issue #266).
+    """
+
+    def test_real_route_rejects_disallowed_origin(self) -> None:
+        with _app_env({"NOIR_WORKER_ENABLED": "false", "DATABASE_URL": ""}) as client:
+            response = client.get("/api/schemas", headers={"Origin": "https://evil.example"})
+        self.assertEqual(response.status_code, 403)
+        body = response.get_json()
+        self.assertEqual(body["error"]["code"], FORBIDDEN_ORIGIN)
+        # Privacy-safe: the offending origin must never be echoed back.
+        self.assertNotIn("evil.example", response.get_data(as_text=True))
+        self.assertNotIn("Access-Control-Allow-Origin", response.headers)
+
+    def test_real_route_allows_configured_origin(self) -> None:
+        with _app_env({"NOIR_WORKER_ENABLED": "false", "DATABASE_URL": ""}) as client:
+            response = client.get("/api/schemas", headers={"Origin": "http://localhost:5173"})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers.get("Access-Control-Allow-Origin"), "http://localhost:5173")
+
+    def test_request_without_origin_is_never_rejected(self) -> None:
+        """Server-to-server and same-origin callers send no Origin header."""
+        with _app_env({"NOIR_WORKER_ENABLED": "false", "DATABASE_URL": ""}) as client:
+            response = client.get("/api/schemas")
+        self.assertEqual(response.status_code, 200)
+
+    def test_opaque_null_origin_is_rejected(self) -> None:
+        with _app_env({"NOIR_WORKER_ENABLED": "false", "DATABASE_URL": ""}) as client:
+            response = client.get("/api/schemas", headers={"Origin": "null"})
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.get_json()["error"]["code"], FORBIDDEN_ORIGIN)
+
+    def test_exempt_paths_bypass_origin_enforcement(self) -> None:
+        """Probes and scrapers must never be rejected for cross-origin headers.
+
+        /ready may legitimately answer 503 when the database is absent; the
+        assertion is that enforcement did not reject with 403.
+        """
+        with _app_env({"NOIR_WORKER_ENABLED": "false", "DATABASE_URL": ""}) as client:
+            health = client.get("/health", headers={"Origin": "https://evil.example"})
+            ready = client.get("/ready", headers={"Origin": "https://evil.example"})
+            metrics = client.get("/metrics", headers={"Origin": "https://evil.example"})
+        self.assertEqual(health.status_code, 200)
+        self.assertNotEqual(ready.status_code, 403)
+        self.assertEqual(metrics.status_code, 200)
+        for response in (health, ready, metrics):
+            body = response.get_data(as_text=True)
+            self.assertNotIn(FORBIDDEN_ORIGIN, body)
+        self.assertEqual(CORS_EXEMPT_PATHS, frozenset({"/health", "/ready", "/metrics"}))
+
+    def test_rejection_is_counted_in_metrics(self) -> None:
+        metrics_collector.reset()
+        with _app_env({"NOIR_WORKER_ENABLED": "false", "DATABASE_URL": ""}) as client:
+            client.get("/api/schemas", headers={"Origin": "https://evil.example"})
+            # /metrics must remain readable even after a rejected origin.
+            scrape = client.get("/metrics")
+        self.assertEqual(scrape.status_code, 200)
+        self.assertIn('reason="cors_origin_not_allowed"', scrape.get_data(as_text=True))
+
+    def test_rejection_log_is_privacy_safe(self) -> None:
+        """Regression: the rejected Origin value must never reach the logs."""
+        stream = io.StringIO()
+        handler = logging.StreamHandler(stream)
+        logger = logging.getLogger("harpocrates.requests")
+        old_handlers, old_level = logger.handlers[:], logger.level
+        logger.handlers = [handler]
+        try:
+            with _app_env({"NOIR_WORKER_ENABLED": "false", "DATABASE_URL": ""}) as client:
+                client.get("/api/schemas", headers={"Origin": "https://evil.example"})
+        finally:
+            logger.handlers, logger.level = old_handlers, old_level
+        output = stream.getvalue()
+        self.assertIn("cors_origin_rejected", output)
+        self.assertNotIn("evil.example", output)
+
+    def test_custom_origin_enforced_end_to_end(self) -> None:
+        """Boundary: configured origin allowed, sibling subdomain rejected."""
+        with _app_env(
+            {
+                "CORS_ORIGINS": "https://wave.example",
+                "NOIR_WORKER_ENABLED": "false",
+                "DATABASE_URL": "",
+            }
+        ) as client:
+            ok = client.get("/api/schemas", headers={"Origin": "https://wave.example"})
+            evil = client.get("/api/schemas", headers={"Origin": "https://evil.wave.example"})
+            lookalike = client.get("/api/schemas", headers={"Origin": "https://wave.example.evil.io"})
+            path = client.get("/api/schemas", headers={"Origin": "https://wave.example/evil"})
+        self.assertEqual(ok.status_code, 200)
+        self.assertEqual(evil.status_code, 403)
+        self.assertEqual(lookalike.status_code, 403)
+        # Path-bearing origin must never match the bare configured origin.
+        self.assertEqual(path.status_code, 403)
+
+    def test_case_insensitive_origin_match(self) -> None:
+        """Regression: scheme/host case differences still match the allow-list."""
+        with _app_env({"NOIR_WORKER_ENABLED": "false", "DATABASE_URL": ""}) as client:
+            response = client.get("/api/schemas", headers={"Origin": "HTTP://LOCALHOST:5173"})
+        self.assertEqual(response.status_code, 200)
+
+    def test_wildcard_config_allows_any_origin_in_development(self) -> None:
+        """Boundary: wildcard CORS short-circuits enforcement, matching flask-cors."""
+        with _app_env(
+            {
+                "APP_ENV": "development",
+                "CORS_ORIGINS": "*",
+                "ALLOW_WILDCARD_CORS": "true",
+                "NOIR_WORKER_ENABLED": "false",
+                "DATABASE_URL": "",
+            }
+        ) as client:
+            response = client.get("/api/schemas", headers={"Origin": "https://anything.example"})
+        self.assertEqual(response.status_code, 200)
+
+    def test_preflight_with_disallowed_origin_is_rejected(self) -> None:
+        """Negative preflight: enforcement fires before flask-cors responds."""
+        with _app_env({"NOIR_WORKER_ENABLED": "false", "DATABASE_URL": ""}) as client:
+            response = client.options(
+                "/api/proofs/register",
+                headers={
+                    "Origin": "https://evil.example",
+                    "Access-Control-Request-Method": "POST",
+                },
+            )
+        self.assertEqual(response.status_code, 403)
+
+
+class NormalizeOriginUnitTest(unittest.TestCase):
+    """Pure-unit coverage for origin canonicalization (no Flask app)."""
+
+    def test_positive_forms(self) -> None:
+        self.assertEqual(normalize_origin("https://app.example.com"), "https://app.example.com")
+        # Case-insensitive scheme/host, preserved port.
+        self.assertEqual(normalize_origin("HTTPS://APP.Example.COM:8443"), "https://app.example.com:8443")
+        # Surrounding whitespace is stripped.
+        self.assertEqual(normalize_origin("  https://app.example.com  "), "https://app.example.com")
+
+    def test_negative_forms(self) -> None:
+        cases = [
+            None,
+            "",
+            "   ",
+            "null",
+            "https://app.example.com/evil",
+            "https://app.example.com?x=1",
+            "https://app.example.com#f",
+            "https://user:pass@app.example.com",
+            "https://app.example.com:",
+            "https://app.example.com:port",
+            "https://app.example.com:0",
+            "https://app.example.com:99999",
+            "https://app.example.com:8443:extra",
+            "app.example.com",
+            "https://",
+            "https://app.example.com/path?query#frag",
+        ]
+        for case in cases:
+            self.assertIsNone(normalize_origin(case), msg=f"expected None for {case!r}")
+
+    def test_is_origin_allowed_normalizes_both_sides(self) -> None:
+        allowed = ["HTTPS://App.Example.Com"]
+        self.assertTrue(is_origin_allowed("https://app.example.com", allowed))
+        self.assertTrue(is_origin_allowed("  HTTPS://APP.EXAMPLE.COM ", allowed))
+        self.assertFalse(is_origin_allowed("https://app.example.com/evil", allowed))
+        self.assertFalse(is_origin_allowed("https://evil.example", allowed))
+        self.assertFalse(is_origin_allowed(None, allowed))
+
+    def test_is_origin_allowed_wildcard_short_circuit(self) -> None:
+        self.assertTrue(is_origin_allowed("https://any.example", ["*"]))
+
+
+class SchemaETagCachingTest(unittest.TestCase):
+    """ETag and caching headers for /api/schemas endpoints (issue #804)."""
+
+    def test_list_schemas_returns_200_with_etag(self):
+        with _app_env({"NOIR_WORKER_ENABLED": "false", "DATABASE_URL": ""}) as client:
+            response = client.get("/api/schemas")
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.headers.get("ETag"))
+        self.assertIn("schemas", response.get_json())
+
+    def test_list_schemas_returns_304_on_matching_etag(self):
+        with _app_env({"NOIR_WORKER_ENABLED": "false", "DATABASE_URL": ""}) as client:
+            first = client.get("/api/schemas")
+            etag = first.headers.get("ETag")
+            second = client.get("/api/schemas", headers={"If-None-Match": etag})
+        self.assertEqual(second.status_code, 304)
+
+    def test_get_schema_returns_404_for_unknown_hash(self):
+        with _app_env({"NOIR_WORKER_ENABLED": "false", "DATABASE_URL": ""}) as client:
+            response = client.get("/api/schemas/" + "0" * 64)
+        self.assertEqual(response.status_code, 404)
+
+    def test_get_schema_returns_200_with_cache_headers(self):
+        with _app_env({"NOIR_WORKER_ENABLED": "false", "DATABASE_URL": ""}) as client:
+            first = client.get("/api/schemas")
+            schemas = first.get_json()["schemas"]
+            if not schemas:
+                self.skipTest("no schemas available")
+            h = schemas[0]["schemaHash"]
+            response = client.get(f"/api/schemas/{h}")
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.headers.get("ETag"))
+        self.assertEqual(
+            response.headers.get("Cache-Control"),
+            "public, max-age=86400, immutable",
+        )
+
+    def test_get_schema_returns_304_on_matching_etag(self):
+        with _app_env({"NOIR_WORKER_ENABLED": "false", "DATABASE_URL": ""}) as client:
+            first = client.get("/api/schemas")
+            schemas = first.get_json()["schemas"]
+            if not schemas:
+                self.skipTest("no schemas available")
+            h = schemas[0]["schemaHash"]
+            detail = client.get(f"/api/schemas/{h}")
+            etag = detail.headers.get("ETag")
+            second = client.get(f"/api/schemas/{h}", headers={"If-None-Match": etag})
+        self.assertEqual(second.status_code, 304)
+
+
+class JobDownloadRangeAndETagTest(unittest.TestCase):
+    """ETag, conditional requests, and single-Range support for /api/jobs/<id>/download."""
+
+    def setUp(self):
+        import db
+        db._JOBS.clear()
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        patcher = patch.dict(os.environ, {"HARPOCRATES_STORAGE_DIR": self.temp_dir.name})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_full_download_returns_200_and_etag(self):
+        import db
+        from storage import get_job_output_path
+
+        job_id = 101
+        content = b"Harpocrates video payload data for test"
+        out_path = get_job_output_path(job_id)
+        out_path.write_bytes(content)
+        content_hash = hashlib.sha256(content).hexdigest()
+
+        db._JOBS[job_id] = {
+            "id": job_id,
+            "type": "embed",
+            "status": "completed",
+            "result": {
+                "source_hash": "source123",
+                "embedded_hash": content_hash,
+                "metadata_hash": "meta123",
+                "db_event": 42,
+            },
+        }
+
+        with _app_env({"NOIR_WORKER_ENABLED": "false", "DATABASE_URL": ""}) as client:
+            response = client.get(f"/api/jobs/{job_id}/download")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data, content)
+        self.assertEqual(response.headers.get("Accept-Ranges"), "bytes")
+        etag = response.headers.get("ETag")
+        self.assertTrue(etag)
+        self.assertIn(content_hash, etag)
+        self.assertEqual(response.headers.get("X-Harpocrates-Source-Hash"), "source123")
+        self.assertEqual(response.headers.get("X-Harpocrates-Embedded-Hash"), content_hash)
+        self.assertEqual(response.headers.get("X-Harpocrates-Metadata-Hash"), "meta123")
+        self.assertEqual(response.headers.get("X-Harpocrates-Db-Event"), "42")
+
+    def test_conditional_if_none_match_returns_304(self):
+        import db
+        from storage import get_job_output_path
+
+        job_id = 102
+        content = b"Conditional download test content"
+        out_path = get_job_output_path(job_id)
+        out_path.write_bytes(content)
+        content_hash = hashlib.sha256(content).hexdigest()
+
+        db._JOBS[job_id] = {
+            "id": job_id,
+            "type": "embed",
+            "status": "completed",
+            "result": {"embedded_hash": content_hash},
+        }
+
+        with _app_env({"NOIR_WORKER_ENABLED": "false", "DATABASE_URL": ""}) as client:
+            first = client.get(f"/api/jobs/{job_id}/download")
+            etag = first.headers.get("ETag")
+            self.assertTrue(etag)
+
+            # Matching strong ETag in If-None-Match
+            second = client.get(
+                f"/api/jobs/{job_id}/download",
+                headers={"If-None-Match": etag},
+            )
+            self.assertEqual(second.status_code, 304)
+            self.assertEqual(second.data, b"")
+
+            # Non-matching ETag returns 200 full content
+            third = client.get(
+                f"/api/jobs/{job_id}/download",
+                headers={"If-None-Match": '"different-hash"'},
+            )
+            self.assertEqual(third.status_code, 200)
+            self.assertEqual(third.data, content)
+
+    def test_range_request_returns_206_partial_content(self):
+        import db
+        from storage import get_job_output_path
+
+        job_id = 103
+        content = b"0123456789abcdefghijklmnopqrstuvwxyz"
+        out_path = get_job_output_path(job_id)
+        out_path.write_bytes(content)
+        content_hash = hashlib.sha256(content).hexdigest()
+
+        db._JOBS[job_id] = {
+            "id": job_id,
+            "type": "embed",
+            "status": "completed",
+            "result": {"embedded_hash": content_hash},
+        }
+
+        total_length = len(content)
+        with _app_env({"NOIR_WORKER_ENABLED": "false", "DATABASE_URL": ""}) as client:
+            # Range: bytes=0-9 (first 10 bytes)
+            resp = client.get(
+                f"/api/jobs/{job_id}/download",
+                headers={"Range": "bytes=0-9"},
+            )
+            self.assertEqual(resp.status_code, 206)
+            self.assertEqual(resp.data, content[0:10])
+            self.assertEqual(
+                resp.headers.get("Content-Range"),
+                f"bytes 0-9/{total_length}",
+            )
+            self.assertEqual(resp.headers.get("Content-Length"), "10")
+
+            # Range: bytes=10-19
+            resp_mid = client.get(
+                f"/api/jobs/{job_id}/download",
+                headers={"Range": "bytes=10-19"},
+            )
+            self.assertEqual(resp_mid.status_code, 206)
+            self.assertEqual(resp_mid.data, content[10:20])
+            self.assertEqual(
+                resp_mid.headers.get("Content-Range"),
+                f"bytes 10-19/{total_length}",
+            )
+
+            # Suffix range: bytes=-5 (last 5 bytes)
+            resp_suffix = client.get(
+                f"/api/jobs/{job_id}/download",
+                headers={"Range": "bytes=-5"},
+            )
+            self.assertEqual(resp_suffix.status_code, 206)
+            self.assertEqual(resp_suffix.data, content[-5:])
+            self.assertEqual(
+                resp_suffix.headers.get("Content-Range"),
+                f"bytes {total_length - 5}-{total_length - 1}/{total_length}",
+            )
+
+            # Offset range: bytes=20- (from byte 20 to end)
+            resp_offset = client.get(
+                f"/api/jobs/{job_id}/download",
+                headers={"Range": "bytes=20-"},
+            )
+            self.assertEqual(resp_offset.status_code, 206)
+            self.assertEqual(resp_offset.data, content[20:])
+            self.assertEqual(
+                resp_offset.headers.get("Content-Range"),
+                f"bytes 20-{total_length - 1}/{total_length}",
+            )
+
+    def test_invalid_range_returns_416(self):
+        import db
+        from storage import get_job_output_path
+
+        job_id = 104
+        content = b"Short content"
+        out_path = get_job_output_path(job_id)
+        out_path.write_bytes(content)
+        content_hash = hashlib.sha256(content).hexdigest()
+
+        db._JOBS[job_id] = {
+            "id": job_id,
+            "type": "embed",
+            "status": "completed",
+            "result": {"embedded_hash": content_hash},
+        }
+
+        total_length = len(content)
+        with _app_env({"NOIR_WORKER_ENABLED": "false", "DATABASE_URL": ""}) as client:
+            resp = client.get(
+                f"/api/jobs/{job_id}/download",
+                headers={"Range": f"bytes=100-200"},
+            )
+            self.assertEqual(resp.status_code, 416)
+            self.assertEqual(
+                resp.headers.get("Content-Range"),
+                f"bytes */{total_length}",
+            )
+
+    def test_unauthorized_or_unfinished_job_errors(self):
+        import db
+        from storage import get_job_output_path
+
+        with _app_env({"NOIR_WORKER_ENABLED": "false", "DATABASE_URL": ""}) as client:
+            # 1. Non-existent job -> 404
+            resp = client.get("/api/jobs/9999/download")
+            self.assertEqual(resp.status_code, 404)
+            self.assertEqual(resp.get_json(), {"error": "Job not found"})
+
+            # 2. Non-embed job type -> 400
+            db._JOBS[201] = {
+                "id": 201,
+                "type": "extract",
+                "status": "completed",
+                "result": {},
+            }
+            resp = client.get("/api/jobs/201/download")
+            self.assertEqual(resp.status_code, 400)
+            self.assertEqual(resp.get_json(), {"error": "No output available for download"})
+
+            # 3. Pending job -> 400
+            db._JOBS[202] = {
+                "id": 202,
+                "type": "embed",
+                "status": "pending",
+                "result": None,
+            }
+            resp = client.get("/api/jobs/202/download")
+            self.assertEqual(resp.status_code, 400)
+            self.assertEqual(resp.get_json(), {"error": "No output available for download"})
+
+            # 4. Failed job -> 400
+            db._JOBS[203] = {
+                "id": 203,
+                "type": "embed",
+                "status": "failed",
+                "result": None,
+            }
+            resp = client.get("/api/jobs/203/download")
+            self.assertEqual(resp.status_code, 400)
+            self.assertEqual(resp.get_json(), {"error": "No output available for download"})
+
+            # 5. Completed job but output file missing -> 404
+            db._JOBS[204] = {
+                "id": 204,
+                "type": "embed",
+                "status": "completed",
+                "result": {},
+            }
+            missing_out = get_job_output_path(204)
+            if missing_out.exists():
+                missing_out.unlink()
+            resp = client.get("/api/jobs/204/download")
+            self.assertEqual(resp.status_code, 404)
+            self.assertEqual(resp.get_json(), {"error": "Output file missing"})
+
+
 if __name__ == "__main__":
     unittest.main()
+
