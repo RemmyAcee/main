@@ -47,6 +47,41 @@ crypto-domain, metadata, and digest outcomes. Digest drift is reported as
 artifact pins are refreshed. Use `--strict` when digests must match exactly.
 The report never includes media, witnesses, credentials, proofs, or secrets.
 
+## Protocol helper consolidation report
+
+The read-only DevX report inventories matching exported entry points in the
+browser and backend verifier-input codecs, along with production import paths:
+
+```bash
+python devx/client_consolidation_report.py
+python -m pytest devx/test_client_consolidation_report.py
+```
+
+The JSON output identifies duplicate entry points for human review; it does not
+delete, rewrite, or select a canonical implementation. Test and spec imports are
+excluded from the active-import list. The report includes source paths and
+symbol names only, not implementation text or protocol data.
+
+## Synthetic media fixtures
+
+Generate synthetic video locally for API, interoperability, or packaging
+workflows without supplying real media:
+
+```bash
+python3 devx/generate_synthetic_media.py --output /tmp/harpocrates-synthetic.mp4 --seed 17
+```
+
+The generator uses FFmpeg's synthetic `testsrc2` source, fixed metadata, and a
+seeded noise filter. It accepts no media input, limits dimensions to 1280x1280,
+duration to 10 seconds, and output to 64 MiB, and does not overwrite an existing
+file unless `--force` is specified. Failures report stable categories without
+printing FFmpeg output or media contents. The output is byte-reproducible for
+identical arguments with the same pinned FFmpeg and encoder build; changing
+that build can change encoded bytes. No canonical metadata, proof, or stored
+evidence format is created or changed. Rolling back only requires removing the
+DevX generator and its focused coverage; there is no migration or deployment
+state to repair.
+
 ## C2PA Interoperability & Bounded Parser
 
 External C2PA manifests entering Harpocrates boundaries are parsed using the bounded parser (`devx/c2pa_parser.py` and `devx/validate_c2pa_manifests.py`).

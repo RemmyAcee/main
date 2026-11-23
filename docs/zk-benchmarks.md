@@ -20,6 +20,9 @@ rollout/rollback, and limitations.
 | `zk/bench/browser_runner.mjs` | Node/bb.js prove+verify timings (browser-equivalent) |
 | `zk/bench/results/` | Local reports (gitignored; never commit proof material) |
 | `zk/bench/baselines.lock.json` | Published proof benchmark thresholds (absent ⇒ compare is inert) |
+| `zk/bench/gates.lock.json` | Committed circuit ACIR opcode and backend gate counts |
+| `zk/bench/gates.py` | Circuit gate and opcode regression check tool (`check`, `--update`) |
+| `zk/bench/test_gates.py` | Unit tests for gate check comparison and parser logic |
 | `.github/workflows/zk-ci.yml` | Runs `pytest zk/bench` alongside artifact tooling |
 
 ## Targets
@@ -27,13 +30,33 @@ rollout/rollback, and limitations.
 | Target | What is measured |
 | --- | --- |
 | `native` | Host CLI path (`nargo`/`bb` when present; synthetic fallback only when `--synthetic`) |
-| `browser` | Node + `@aztec/bb.js` UltraHonk prove/verify (same stack as the Evidence Studio worker) |
+| `browser` | Node + `@aztec/bb.js` UltraHonk prove/verify (same stack as the Evidence Studio worker and its non-worker fallback) |
 | `ci` | CI-tagged run; synthetic driver allowed so PR checks stay hermetic without the proving toolchain |
 | `soroban_adjacent` | Host CPU/memory budget envelope for `register_anonymous_verified` / public-input classify (see `test_budget.rs`) |
+| `revocation_native` | Host CLI path for `revocation_witness` at `MAX_REVOCATION_WITNESS_DEPTH = 16` (65,536 leaves) |
+| `revocation_browser` | Node + `@aztec/bb.js` UltraHonk prove/verify for `revocation_witness` at `MAX_REVOCATION_WITNESS_DEPTH = 16` |
+| `revocation_ci` | Hermetic CI gate for `revocation_witness` at `MAX_REVOCATION_WITNESS_DEPTH = 16` (65,536 leaves, 128-byte public inputs) |
 
 Cold samples approximate a fresh process/worker. Warm samples discard
 `warm_discard` iterations, then record `warm_samples`. Percentiles are computed
 only over successful measured samples.
+
+### Browser runner modes
+
+`browser_runner.mjs --mode worker|main` (default `worker`) selects which prover
+runtime the run stands in for:
+
+- `worker` — the Web Worker proving path.
+- `main` — the non-worker fallback, which is exercised under the same explicit
+  limits the frontend enforces at runtime (256-byte secret cap, single
+  concurrent proof, per-sample timeout). The report records `mode` and
+  `runtime.threading.max_concurrency`, and `test_zk_bench.py` asserts the lock
+  keeps the browser target's concurrency/timeout compatible with the frontend
+  fallback bounds.
+
+Both modes run the identical Node/bb.js prover; the flag exists so regressions
+in the fallback limits or a drift between paths are measured and reported, not
+silently assumed identical.
 
 ## Threat assumptions
 
@@ -41,8 +64,10 @@ The harness defends against:
 
 - **Unbounded work.** Sample counts, proof/public-input/witness byte ceilings,
   concurrency, per-sample timeouts, and a wall-clock cap are enforced by
-  `bench.lock.json`. Oversized or capacity-exceeding work fails with a typed
-  reject code — never hangs.
+  `bench.lock.json`. The Evidence Studio proof worker imports the same witness,
+  proof, and public-input ceilings, while browser ACIR byte ceilings come from
+  `zk/browser.artifacts.manifest.json`. Oversized or capacity-exceeding work
+  fails with a typed reject code — never hangs.
 - **Partial promotion.** A report is written only when `outcome=ok`. Timeouts,
   cancellations, rejections, and fatals abort without leaving a trusted report.
 - **Evidence leakage.** Reports and stderr signals carry timings, percentiles,
@@ -90,6 +115,8 @@ zk/bench/run.sh metadata
 cd frontend && npm ci
 # build ACIR via zk/noir scripts, then:
 node zk/bench/browser_runner.mjs --cold 1 --warm 2
+# exercise the non-worker fallback path under its explicit limits:
+node zk/bench/browser_runner.mjs --mode main --cold 1 --warm 1
 ```
 
 ## Configuration
@@ -98,6 +125,7 @@ node zk/bench/browser_runner.mjs --cold 1 --warm 2
 | --- | --- | --- |
 | per-target sample counts / timeouts | `zk/bench/bench.lock.json` | Bound work |
 | size ceilings | `limits.*` | Reject oversized proof/PI/witness/report |
+| proof-worker memory | `limits.max_witness_bytes` + browser manifest raw bytes | Bound browser ACIR, witness, proof, and public-input memory before expensive worker/prover boundaries |
 | privacy forbidden keys | `privacy.*` | Fail closed if a report grows a sensitive field |
 | baselines path | `thresholds.baselines_path` | Published regression gate (`baselines.lock.json`) |
 

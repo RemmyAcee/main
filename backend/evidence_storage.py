@@ -1,61 +1,112 @@
-import os
-import hashlib
-from typing import Tuple
-from cryptography.fernet import Fernet
-import db
+"""Path-safety validation for evidence storage destinations.
 
-def generate_dek() -> Tuple[bytes, bytes]:
-    """Generates a Data Encryption Key (DEK) and its encrypted form (using a Master Key)."""
-    master_key_b64 = os.getenv("MASTER_ENCRYPTION_KEY")
-    if not master_key_b64:
-        master_key_b64 = Fernet.generate_key().decode()
-    f = Fernet(master_key_b64.encode())
-    
-    dek = Fernet.generate_key()
-    encrypted_dek = f.encrypt(dek)
-    
-    return dek, encrypted_dek
+This module provides a single public function,
+:func:`assert_safe_destination`, which must be called before any write
+into the evidence storage directory.  It resolves the candidate path to
+its real filesystem location and rejects it when it aliases a protected
+file or directory (the metadata database, encryption-key material, the
+application source tree, or any other caller-supplied protected path).
 
-def decrypt_dek(encrypted_dek: bytes) -> bytes:
-    master_key_b64 = os.getenv("MASTER_ENCRYPTION_KEY")
-    if not master_key_b64:
-        raise ValueError("MASTER_ENCRYPTION_KEY is not set")
-    f = Fernet(master_key_b64.encode())
-    return f.decrypt(encrypted_dek)
+Design
+------
+* All comparisons are made on *resolved* (``Path.resolve()``) paths so
+  that symbolic links, ``..`` components, and platform case-folding
+  cannot be used to bypass the check.
+* A destination is considered to alias a protected path when:
+  - it is exactly equal to the protected path, or
+  - it is a descendant of the protected path (i.e. it falls inside a
+    protected directory), or
+  - it is an ancestor of the protected path (i.e. it *is* a protected
+    directory or one of its parents — writing here would replace the
+    directory entry that guards the protected file).
 
-def get_encryptor(dek: bytes):
-    return Fernet(dek)
+Raises
+------
+ValueError
+    Raised (not a custom exception) so that the existing
+    ``@app.errorhandler(ValueError)`` in ``app.py`` converts it to a
+    400 response without additional wiring.
+"""
 
-def record_blob(content_hash: str, encrypted_dek: bytes, size_bytes: int, storage_path: str):
-    with db.get_connection() as conn:
-        with conn.cursor() as cursor:
-            cursor.execute(
-                """
-                insert into blobs (content_hash, encrypted_dek, size_bytes, storage_path)
-                values (%s, %s, %s, %s)
-                on conflict (content_hash) do nothing
-                """,
-                (content_hash, encrypted_dek.decode(), size_bytes, storage_path)
+from __future__ import annotations
+
+from pathlib import Path
+
+
+def assert_safe_destination(
+    destination: Path,
+    protected_paths: frozenset[Path],
+) -> None:
+    """Raise :class:`ValueError` when *destination* aliases a protected path.
+
+    Parameters
+    ----------
+    destination:
+        The fully-resolved output path that is about to be written.
+        The caller must pass the result of ``Path(...).resolve()`` — a
+        relative or unresolved path will be resolved here as a defensive
+        measure, but the expectation is that the caller has already done
+        this.
+    protected_paths:
+        A frozen set of *resolved* :class:`~pathlib.Path` objects that
+        must never be overwritten or shadowed.  Obtain this set from
+        :func:`storage._collect_protected_paths` or construct it
+        directly in tests.
+
+    Raises
+    ------
+    ValueError
+        When *destination* is equal to, a descendant of, or an ancestor
+        of any path in *protected_paths*.
+
+    Examples
+    --------
+    >>> from pathlib import Path
+    >>> from evidence_storage import assert_safe_destination
+    >>> safe = Path("/var/evidence/abc123.bin").resolve()
+    >>> protected = frozenset({Path("/etc/app/keys.pem").resolve()})
+    >>> assert_safe_destination(safe, protected)  # no exception
+    >>> assert_safe_destination(Path("/etc/app/keys.pem"), protected)
+    Traceback (most recent call last):
+        ...
+    ValueError: destination '/etc/app/keys.pem' aliases protected path '/etc/app/keys.pem'
+    """
+    resolved = destination.resolve()
+
+    for protected in protected_paths:
+        reason = _alias_reason(resolved, protected)
+        if reason is not None:
+            raise ValueError(
+                f"destination '{resolved}' aliases protected path "
+                f"'{protected}': {reason}"
             )
-        conn.commit()
 
-def record_tenant_ref(tenant_id: str, content_hash: str):
-    with db.get_connection() as conn:
-        with conn.cursor() as cursor:
-            cursor.execute(
-                """
-                insert into tenant_blob_refs (tenant_id, content_hash, ref_count)
-                values (%s, %s, 1)
-                on conflict (tenant_id, content_hash) do update
-                set ref_count = tenant_blob_refs.ref_count + 1, updated_at = now()
-                """,
-                (tenant_id, content_hash)
-            )
-        conn.commit()
 
-def get_blob_info(content_hash: str) -> dict | None:
-    with db.get_connection() as conn:
-        with conn.cursor() as cursor:
-            cursor.execute("select encrypted_dek, storage_path from blobs where content_hash = %s", (content_hash,))
-            row = cursor.fetchone()
-            return dict(row) if row else None
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+
+def _alias_reason(resolved: Path, protected: Path) -> str | None:
+    """Return a human-readable reason string when *resolved* aliases *protected*.
+
+    Returns ``None`` when there is no alias relationship.
+    """
+    if resolved == protected:
+        return "paths are identical"
+
+    # destination is inside a protected directory
+    try:
+        resolved.relative_to(protected)
+        return "destination is inside a protected directory"
+    except ValueError:
+        pass
+
+    # destination would contain (be a parent of) a protected file/directory
+    try:
+        protected.relative_to(resolved)
+        return "destination is a parent of a protected path"
+    except ValueError:
+        pass
+
+    return None

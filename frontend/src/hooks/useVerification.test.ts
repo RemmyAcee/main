@@ -12,6 +12,7 @@ vi.mock('../services/verificationService', () => ({
   extractMetadata: vi.fn(),
   fetchProofEventsByVideo: vi.fn(),
   getOnChainProof: vi.fn(),
+  getMetadataEnvelope: vi.fn(),
 }))
 
 vi.mock('../services/evidenceService', () => ({
@@ -31,6 +32,7 @@ async function getVerifMock() {
     extractMetadata: ReturnType<typeof vi.fn>
     fetchProofEventsByVideo: ReturnType<typeof vi.fn>
     getOnChainProof: ReturnType<typeof vi.fn>
+    getMetadataEnvelope: ReturnType<typeof vi.fn>
   }
 }
 
@@ -52,6 +54,7 @@ beforeEach(async () => {
   vm.extractMetadata.mockResolvedValue({ hasHarpocratesMetadata: true })
   vm.fetchProofEventsByVideo.mockResolvedValue([])
   vm.getOnChainProof.mockResolvedValue(null)
+  vm.getMetadataEnvelope.mockResolvedValue(null)
 })
 
 afterEach(() => {
@@ -147,6 +150,84 @@ describe('useVerification.verifyEvidence – harpocrates metadata found', () => 
       await result.current.verifyEvidence(makeVideoFile('old.mp4'))
     })
     expect(result.current.status).toBe('success')
+    expect(result.current.verifyResult).toMatch(/confirmed/i)
+  })
+})
+
+// ── metadata envelope comparison ────────────────────────────────────
+
+describe('useVerification – metadata envelope comparison', () => {
+  it('succeeds when envelope metadata hash matches extracted hash', async () => {
+    const vm = await getVerifMock()
+    vm.fetchProofEventsByVideo.mockResolvedValue([
+      { id: 1, event_type: 'registered', file_name: null, video_hash: null, proof_id: null, tier: null, created_at: '' },
+    ])
+    vm.getOnChainProof.mockResolvedValue({
+      videoHash: 'a'.repeat(64),
+      metadataHash: 'b'.repeat(64),
+      tier: 1,
+      status: 1,
+      createdAt: '1000',
+      source: null,
+      issuer: null,
+    })
+    vm.getMetadataEnvelope.mockResolvedValue({
+      version: 1,
+      metadataHash: 'b'.repeat(64),
+      boundAt: '1000',
+    })
+    const { result } = renderHook(() => useVerification())
+    await act(async () => { await result.current.verifyEvidence(makeVideoFile()) })
+    expect(result.current.status).toBe('success')
+    expect(result.current.errorCode).toBeNull()
+    expect(result.current.verifyResult).toMatch(/confirmed/i)
+  })
+
+  it('flags a distinct error code when envelope metadata hash mismatches', async () => {
+    const vm = await getVerifMock()
+    vm.fetchProofEventsByVideo.mockResolvedValue([
+      { id: 1, event_type: 'registered', file_name: null, video_hash: null, proof_id: null, tier: null, created_at: '' },
+    ])
+    vm.getOnChainProof.mockResolvedValue({
+      videoHash: 'a'.repeat(64),
+      metadataHash: 'b'.repeat(64),
+      tier: 1,
+      status: 1,
+      createdAt: '1000',
+      source: null,
+      issuer: null,
+    })
+    vm.getMetadataEnvelope.mockResolvedValue({
+      version: 1,
+      metadataHash: 'c'.repeat(64),
+      boundAt: '1000',
+    })
+    const { result } = renderHook(() => useVerification())
+    await act(async () => { await result.current.verifyEvidence(makeVideoFile()) })
+    expect(result.current.status).toBe('error')
+    expect(result.current.errorCode).toBe('METADATA_ENVELOPE_MISMATCH')
+    expect(result.current.verifyResult).toMatch(/envelope/i)
+  })
+
+  it('does not change behaviour when no envelope is bound', async () => {
+    const vm = await getVerifMock()
+    vm.fetchProofEventsByVideo.mockResolvedValue([
+      { id: 1, event_type: 'registered', file_name: null, video_hash: null, proof_id: null, tier: null, created_at: '' },
+    ])
+    vm.getOnChainProof.mockResolvedValue({
+      videoHash: 'a'.repeat(64),
+      metadataHash: 'b'.repeat(64),
+      tier: 1,
+      status: 1,
+      createdAt: '1000',
+      source: null,
+      issuer: null,
+    })
+    vm.getMetadataEnvelope.mockResolvedValue(null)
+    const { result } = renderHook(() => useVerification())
+    await act(async () => { await result.current.verifyEvidence(makeVideoFile()) })
+    expect(result.current.status).toBe('success')
+    expect(result.current.errorCode).toBeNull()
     expect(result.current.verifyResult).toMatch(/confirmed/i)
   })
 })
@@ -316,7 +397,7 @@ describe('useVerification – cancellation and race handling', () => {
     const vm = await getVerifMock()
     // Make extract hang until we cancel
     let resolveExtract: (v: unknown) => void
-    vm.extractMetadata.mockReturnValue(new Promise(res => { resolveExtract = res as any }))
+    vm.extractMetadata.mockReturnValue(new Promise((resolve) => { resolveExtract = resolve as (value: unknown) => void }))
     vm.fetchProofEventsByVideo.mockResolvedValue([])
     vm.getOnChainProof.mockResolvedValue(null)
 
@@ -342,8 +423,8 @@ describe('useVerification – cancellation and race handling', () => {
     const vm = await getVerifMock()
     let firstExtractResolve: (v: unknown) => void
     let firstDbResolve: (v: unknown) => void
-    vm.extractMetadata.mockImplementationOnce(() => new Promise(res => { firstExtractResolve = res as any }))
-    vm.fetchProofEventsByVideo.mockImplementationOnce(() => new Promise(res => { firstDbResolve = res as any }))
+    vm.extractMetadata.mockImplementationOnce(() => new Promise((resolve) => { firstExtractResolve = resolve as (value: unknown) => void }))
+    vm.fetchProofEventsByVideo.mockImplementationOnce(() => new Promise((resolve) => { firstDbResolve = resolve as (value: unknown) => void }))
     vm.getOnChainProof.mockResolvedValueOnce(null)
     // Second call: fast, will set different outcome
     const fastMeta = { hasHarpocratesMetadata: false }
@@ -371,6 +452,123 @@ describe('useVerification – cancellation and race handling', () => {
     expect(result.current.status).toBe('success')
   })
 
+  it('cancelled shared verification does not overwrite a newer selection when resolving late', async () => {
+    const vm = await getVerifMock()
+    let resolveFirstDb: (v: unknown) => void
+    let resolveFirstChain: (v: unknown) => void
+    vm.fetchProofEventsByVideo.mockImplementationOnce(
+      () => new Promise((resolve) => { resolveFirstDb = resolve as (value: unknown) => void }),
+    )
+    vm.getOnChainProof.mockImplementationOnce(
+      () => new Promise((resolve) => { resolveFirstChain = resolve as (value: unknown) => void }),
+    )
+
+    const hashA = 'a'.repeat(64)
+    const hashB = 'b'.repeat(64)
+    const eventB = { id: 2, event_type: 'registered', file_name: null, video_hash: hashB, proof_id: 'p-b', tier: 'source', created_at: '' }
+    vm.fetchProofEventsByVideo.mockResolvedValueOnce([eventB as unknown as never])
+    vm.getOnChainProof.mockResolvedValueOnce(null)
+
+    const { result } = renderHook(() => useVerification())
+
+    let p1: Promise<void>
+    act(() => {
+      p1 = result.current.loadSharedVerification({
+        protocol: 'harpocrates-verification-link',
+        version: 1,
+        videoHash: hashA,
+        proofId: 'p-a',
+        metadataHash: '',
+        network: 'Test SDF Future Network ; October 2022',
+        contractId: 'C123',
+      })
+    })
+
+    // Allow p1 to start its network requests before cancelling
+    await act(async () => { await new Promise((r) => setTimeout(r, 10)) })
+
+    // Cancel first request, then immediately load a newer selection
+    await act(async () => { result.current.cancel() })
+    expect(result.current.status).toBe('cancelled')
+
+    await act(async () => {
+      await result.current.loadSharedVerification({
+        protocol: 'harpocrates-verification-link',
+        version: 1,
+        videoHash: hashB,
+        proofId: 'p-b',
+        metadataHash: '',
+        network: 'Test SDF Future Network ; October 2022',
+        contractId: 'C123',
+      })
+    })
+
+    // Late resolution from cancelled first request must be ignored
+    await act(async () => {
+      resolveFirstDb!([{ id: 1, event_type: 'registered', file_name: null, video_hash: hashA, proof_id: 'p-a', tier: 'seal', created_at: '' }])
+      resolveFirstChain!({ videoHash: hashA, metadataHash: 'm', tier: 1, status: 1, createdAt: '1', expiresAt: 0, source: null, issuer: null })
+      await p1!.catch(() => {})
+    })
+
+    expect(result.current.verifyHash).toBe(hashB)
+    expect(result.current.events).toEqual([eventB])
+    expect(result.current.chainProof).toBeNull()
+    expect(result.current.status).toBe('success')
+  })
+
+  it('cancelled shared verification rejection does not overwrite a newer selection', async () => {
+    const vm = await getVerifMock()
+    let rejectFirstDb: (err: unknown) => void
+    vm.fetchProofEventsByVideo.mockImplementationOnce(
+      () => new Promise((_, reject) => { rejectFirstDb = reject }),
+    )
+    vm.getOnChainProof.mockResolvedValueOnce(null)
+
+    const hashA = 'a'.repeat(64)
+    const hashB = 'b'.repeat(64)
+    vm.fetchProofEventsByVideo.mockResolvedValueOnce([])
+    vm.getOnChainProof.mockResolvedValueOnce(null)
+
+    const { result } = renderHook(() => useVerification())
+
+    let p1: Promise<void>
+    act(() => {
+      p1 = result.current.loadSharedVerification({
+        protocol: 'harpocrates-verification-link',
+        version: 1,
+        videoHash: hashA,
+        proofId: 'p-a',
+        metadataHash: '',
+        network: 'Test SDF Future Network ; October 2022',
+        contractId: 'C123',
+      })
+    })
+
+    await act(async () => { await new Promise((r) => setTimeout(r, 10)) })
+    await act(async () => { result.current.cancel() })
+    await act(async () => {
+      await result.current.loadSharedVerification({
+        protocol: 'harpocrates-verification-link',
+        version: 1,
+        videoHash: hashB,
+        proofId: 'p-b',
+        metadataHash: '',
+        network: 'Test SDF Future Network ; October 2022',
+        contractId: 'C123',
+      })
+    })
+
+    // Late failure from cancelled first request must not clobber newer success state
+    await act(async () => {
+      rejectFirstDb!(new Error('late network error'))
+      await p1!.catch(() => {})
+    })
+
+    expect(result.current.verifyHash).toBe(hashB)
+    expect(result.current.status).toBe('success')
+    expect(result.current.errorCode).toBeNull()
+  })
+
   it('retry re-runs last verification', async () => {
     const vm = await getVerifMock()
     vm.extractMetadata.mockResolvedValueOnce({ hasHarpocratesMetadata: true })
@@ -378,7 +576,8 @@ describe('useVerification – cancellation and race handling', () => {
     vm.getOnChainProof.mockResolvedValueOnce(null)
     // retry will call again
     vm.extractMetadata.mockResolvedValueOnce({ hasHarpocratesMetadata: true })
-    vm.fetchProofEventsByVideo.mockResolvedValueOnce([{ id: 9, event_type: 'registered', file_name: null, video_hash: null, proof_id: null, tier: null, created_at: '' } as any])
+    const proofEvent = { id: 9, event_type: 'registered', file_name: null, video_hash: null, proof_id: null, tier: null, created_at: '' }
+    vm.fetchProofEventsByVideo.mockResolvedValueOnce([proofEvent as unknown as never])
     const { result } = renderHook(() => useVerification())
     await act(async () => { await result.current.verifyEvidence(makeVideoFile()) })
     expect(result.current.events).toHaveLength(0)
@@ -506,6 +705,7 @@ describe('useVerification – offline mode', () => {
     expect(vm.extractMetadata).not.toHaveBeenCalled()
     expect(vm.fetchProofEventsByVideo).not.toHaveBeenCalled()
     expect(vm.getOnChainProof).not.toHaveBeenCalled()
+    expect(vm.getMetadataEnvelope).not.toHaveBeenCalled()
   })
 
   it('reports tampered binding as invalid evidence in offline mode', async () => {

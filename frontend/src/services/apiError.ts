@@ -25,6 +25,17 @@ export type BackendErrorCode =
   | 'NOT_FOUND'
   | 'INTERNAL_ERROR'
   | 'UNSUPPORTED_MEDIA_TYPE'
+  | 'REPORTER_ON_COOLDOWN'
+  | 'TOO_MANY_OPEN_DISPUTES'
+  | 'DISPUTE_WINDOW_EXPIRED'
+  | 'UNAUTHORIZED_RESPONDER'
+  | 'DISPUTE_NOT_FOUND'
+  | 'DISPUTE_ALREADY_CLOSED'
+  | 'INVALID_DISPUTE_TRANSITION'
+  | 'RATE_LIMITED'
+  | 'QUEUE_FULL'
+  | 'IDENTITY_LIMIT'
+  | 'TIMEOUT'
   | 'UNKNOWN'
 
 /** What the UI should nudge the user to do next. */
@@ -46,6 +57,10 @@ export type ActionableApiError = {
   action: ActionHint
   retryable: boolean
   status: number
+  /** Backend queue or admission reason when provided (e.g. queue_full, identity_limit, timeout). */
+  reason?: string | null
+  /** Retry-After duration in seconds parsed from headers. */
+  retryAfter?: number | null
 }
 
 const KNOWN_CODES: ReadonlySet<string> = new Set([
@@ -54,6 +69,17 @@ const KNOWN_CODES: ReadonlySet<string> = new Set([
   'NOT_FOUND',
   'INTERNAL_ERROR',
   'UNSUPPORTED_MEDIA_TYPE',
+  'REPORTER_ON_COOLDOWN',
+  'TOO_MANY_OPEN_DISPUTES',
+  'DISPUTE_WINDOW_EXPIRED',
+  'UNAUTHORIZED_RESPONDER',
+  'DISPUTE_NOT_FOUND',
+  'DISPUTE_ALREADY_CLOSED',
+  'INVALID_DISPUTE_TRANSITION',
+  'RATE_LIMITED',
+  'QUEUE_FULL',
+  'IDENTITY_LIMIT',
+  'TIMEOUT',
 ])
 
 type CodeGuidance = {
@@ -89,10 +115,68 @@ const CODE_GUIDANCE: Record<Exclude<BackendErrorCode, 'UNKNOWN'>, CodeGuidance> 
     retryable: false,
     fallbackMessage: 'Unsupported file type. Use an MP4, WebM, or MOV video.',
   },
+  REPORTER_ON_COOLDOWN: {
+    action: 'retry',
+    retryable: true,
+    fallbackMessage: 'You are on cooldown. Please wait 24 hours between dispute submissions for this proof before trying again.',
+  },
+  TOO_MANY_OPEN_DISPUTES: {
+    action: 'check_resource',
+    retryable: false,
+    fallbackMessage: 'Maximum open disputes reached for this proof (limit: 4). Existing disputes must be resolved before a new one can be opened.',
+  },
+  DISPUTE_WINDOW_EXPIRED: {
+    action: 'none',
+    retryable: false,
+    fallbackMessage: 'The dispute window has expired. The deadline for responding or resolving this dispute has passed.',
+  },
+  UNAUTHORIZED_RESPONDER: {
+    action: 'fix_input',
+    retryable: false,
+    fallbackMessage: 'Unauthorized responder. Only the proof issuer or source may submit a dispute response.',
+  },
+  DISPUTE_NOT_FOUND: {
+    action: 'check_resource',
+    retryable: false,
+    fallbackMessage: 'Dispute or proof record not found. Verify the identifiers and try again.',
+  },
+  DISPUTE_ALREADY_CLOSED: {
+    action: 'none',
+    retryable: false,
+    fallbackMessage: 'This dispute is already closed and cannot be transitioned.',
+  },
+  INVALID_DISPUTE_TRANSITION: {
+    action: 'fix_input',
+    retryable: false,
+    fallbackMessage: 'Invalid dispute transition. The dispute is not in a state that permits this action.',
+  },
+  RATE_LIMITED: {
+    action: 'retry',
+    retryable: true,
+    fallbackMessage: 'Upload rate limit exceeded. Please wait before submitting another video.',
+  },
+  QUEUE_FULL: {
+    action: 'retry',
+    retryable: true,
+    fallbackMessage: 'The upload queue is currently full. Server is processing at capacity, please try again shortly.',
+  },
+  IDENTITY_LIMIT: {
+    action: 'retry',
+    retryable: true,
+    fallbackMessage: 'You have reached the concurrent upload limit for your identity. Please wait for in-flight requests to complete.',
+  },
+  TIMEOUT: {
+    action: 'retry',
+    retryable: true,
+    fallbackMessage: 'Upload timed out while waiting in the processing queue. Please try again.',
+  },
 }
 
 function stripHtml(input: string): string {
-  return input.replace(/<[^>]*>/g, '')
+  return input
+    .replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, '')
+    .replace(/<style\b[^<]*(?:(?!<\/style>)<[^<]*)*<\/style>/gi, '')
+    .replace(/<[^>]*>/g, '')
 }
 
 function truncate(input: string): string {
@@ -117,20 +201,41 @@ function codeFromStatus(status: number): BackendErrorCode {
   return 'UNKNOWN'
 }
 
-function buildActionableMessage(code: BackendErrorCode, detail: string | null): string {
+function buildActionableMessage(
+  code: BackendErrorCode,
+  detail: string | null,
+  retryAfter?: number | null,
+): string {
   if (code !== 'UNKNOWN') {
     const guidance = CODE_GUIDANCE[code]
+    if (retryAfter && retryAfter > 0) {
+      if (code === 'QUEUE_FULL') {
+        return `The upload queue is currently full. Please retry in ${retryAfter} seconds.`
+      }
+      if (code === 'RATE_LIMITED') {
+        return `Upload rate limit exceeded. Please retry in ${retryAfter} seconds.`
+      }
+      if (code === 'IDENTITY_LIMIT') {
+        return `Concurrent upload limit reached for your identity. Please wait ${retryAfter} seconds before retrying.`
+      }
+      if (code === 'TIMEOUT') {
+        return `Upload timed out in queue. Please retry in ${retryAfter} seconds.`
+      }
+    }
     // Prefer backend detail when it already sounds actionable; otherwise use guidance.
-    if (detail && detail.length >= 12) {
+    if (detail && detail.length > 0) {
       // Ensure size/type codes always include a concrete next step.
       if (code === 'PAYLOAD_TOO_LARGE' && !/smaller|size|large|limit|MB|bytes/i.test(detail)) {
         return sanitizeText(`${detail} Choose a smaller video and try again.`)
       }
-      if (code === 'UNSUPPORTED_MEDIA_TYPE' && !/MP4|WebM|MOV|supported|type/i.test(detail)) {
+      if (code === 'UNSUPPORTED_MEDIA_TYPE' && !/MP4|WebM|MOV/i.test(detail)) {
         return sanitizeText(`${detail} Use an MP4, WebM, or MOV video.`)
       }
       if (code === 'INTERNAL_ERROR' && !/retry|try again|moment/i.test(detail)) {
         return sanitizeText(`${detail} Retry in a moment.`)
+      }
+      if (code === 'QUEUE_FULL' && /overload/i.test(detail)) {
+        return guidance.fallbackMessage
       }
       return detail
     }
@@ -145,9 +250,10 @@ function extractEnvelope(body: unknown): {
   code: string | null
   message: string | null
   requestId: string | null
+  reason: string | null
 } {
   if (body == null || typeof body !== 'object') {
-    return { code: null, message: null, requestId: null }
+    return { code: null, message: null, requestId: null, reason: null }
   }
   const record = body as Record<string, unknown>
   const raw = record.error
@@ -155,6 +261,8 @@ function extractEnvelope(body: unknown): {
   let message: string | null = null
   let requestId: string | null =
     typeof record.request_id === 'string' ? record.request_id : null
+  let reason: string | null =
+    typeof record.reason === 'string' ? record.reason : null
 
   if (typeof raw === 'string') {
     message = raw
@@ -163,9 +271,10 @@ function extractEnvelope(body: unknown): {
     if (typeof inner.code === 'string') code = inner.code
     if (typeof inner.message === 'string') message = inner.message
     if (typeof inner.request_id === 'string') requestId = inner.request_id
+    if (!reason && typeof inner.reason === 'string') reason = inner.reason
   }
 
-  return { code, message, requestId }
+  return { code, message, requestId, reason }
 }
 
 /**
@@ -176,6 +285,10 @@ export async function parseActionableApiError(
   fallback: string,
 ): Promise<ActionableApiError> {
   const status = typeof response.status === 'number' ? response.status : 0
+  const retryAfterHeader = response.headers?.get?.('Retry-After')
+  const retryAfter = retryAfterHeader ? parseInt(retryAfterHeader, 10) : null
+  const validRetryAfter = typeof retryAfter === 'number' && !Number.isNaN(retryAfter) ? retryAfter : null
+
   let body: unknown
   try {
     body = await response.json()
@@ -190,18 +303,31 @@ export async function parseActionableApiError(
       action: guidance?.action ?? (status >= 500 ? 'retry' : 'none'),
       retryable: guidance?.retryable ?? status >= 500,
       status,
+      reason: null,
+      retryAfter: validRetryAfter,
     }
   }
 
   const extracted = extractEnvelope(body)
   const detail = extracted.message ? sanitizeText(extracted.message) : null
-  const code: BackendErrorCode =
-    extracted.code && isKnownCode(extracted.code)
-      ? extracted.code
-      : codeFromStatus(status)
+
+  let code: BackendErrorCode
+  if (extracted.code && isKnownCode(extracted.code)) {
+    code = extracted.code
+  } else if (extracted.reason === 'queue_full') {
+    code = 'QUEUE_FULL'
+  } else if (extracted.reason === 'identity_limit') {
+    code = 'IDENTITY_LIMIT'
+  } else if (extracted.reason === 'timeout') {
+    code = 'TIMEOUT'
+  } else if (status === 429) {
+    code = 'RATE_LIMITED'
+  } else {
+    code = codeFromStatus(status)
+  }
 
   const guidance = code !== 'UNKNOWN' ? CODE_GUIDANCE[code] : null
-  const message = buildActionableMessage(code, detail) || sanitizeText(fallback)
+  const message = buildActionableMessage(code, detail, validRetryAfter) || sanitizeText(fallback)
 
   return {
     code,
@@ -209,8 +335,10 @@ export async function parseActionableApiError(
     detail,
     requestId: extracted.requestId,
     action: guidance?.action ?? 'none',
-    retryable: guidance?.retryable ?? false,
+    retryable: guidance?.retryable ?? (status >= 500 || status === 429),
     status,
+    reason: extracted.reason,
+    retryAfter: validRetryAfter,
   }
 }
 
@@ -234,6 +362,8 @@ export class ApiClientError extends Error {
   readonly requestId: string | null
   readonly status: number
   readonly detail: string | null
+  readonly reason: string | null
+  readonly retryAfter: number | null
 
   constructor(actionable: ActionableApiError) {
     super(actionable.message)
@@ -244,6 +374,8 @@ export class ApiClientError extends Error {
     this.requestId = actionable.requestId
     this.status = actionable.status
     this.detail = actionable.detail
+    this.reason = actionable.reason ?? null
+    this.retryAfter = actionable.retryAfter ?? null
   }
 }
 
@@ -254,8 +386,13 @@ export function toVerificationErrorCode(
   | 'UNSUPPORTED_ARTIFACT'
   | 'OVERSIZED_ARTIFACT'
   | 'INVALID_EVIDENCE'
+  | 'TIMEOUT'
   | 'DEPENDENCY_UNAVAILABLE'
   | null {
+  if (
+    error instanceof Error &&
+    ((('code' in error) && error.code === 'timeout') || error.name === 'TimeoutError')
+  ) return 'TIMEOUT'
   if (!(error instanceof ApiClientError)) return null
   switch (error.code) {
     case 'PAYLOAD_TOO_LARGE':
@@ -264,11 +401,146 @@ export function toVerificationErrorCode(
       return 'UNSUPPORTED_ARTIFACT'
     case 'VALIDATION_ERROR':
       return 'INVALID_EVIDENCE'
+    case 'TIMEOUT':
+      return 'TIMEOUT'
     case 'NOT_FOUND':
     case 'INTERNAL_ERROR':
+    case 'RATE_LIMITED':
+    case 'QUEUE_FULL':
+    case 'IDENTITY_LIMIT':
     case 'UNKNOWN':
       return 'DEPENDENCY_UNAVAILABLE'
     default:
       return 'DEPENDENCY_UNAVAILABLE'
   }
 }
+
+export type UploadAdmissionReason =
+  | 'queue_full'
+  | 'identity_limit'
+  | 'timeout'
+  | 'rate_limited'
+
+/** Returns true if the error represents a backend admission control or queue limit rejection. */
+export function isAdmissionError(error: unknown): boolean {
+  if (error instanceof ApiClientError) {
+    return (
+      error.code === 'QUEUE_FULL' ||
+      error.code === 'IDENTITY_LIMIT' ||
+      error.code === 'TIMEOUT' ||
+      error.code === 'RATE_LIMITED' ||
+      error.reason === 'queue_full' ||
+      error.reason === 'identity_limit' ||
+      error.reason === 'timeout' ||
+      error.status === 429 ||
+      (error.status === 503 && Boolean(error.detail?.toLowerCase().includes('overload') || error.reason))
+    )
+  }
+  return false
+}
+
+/** Extracts the canonical UploadAdmissionReason from an error, or null if not an admission rejection. */
+export function toAdmissionReason(error: unknown): UploadAdmissionReason | null {
+  if (!(error instanceof ApiClientError)) return null
+  if (error.reason === 'queue_full' || error.code === 'QUEUE_FULL') return 'queue_full'
+  if (error.reason === 'identity_limit' || error.code === 'IDENTITY_LIMIT') return 'identity_limit'
+  if (error.reason === 'timeout' || error.code === 'TIMEOUT') return 'timeout'
+  if (error.code === 'RATE_LIMITED' || error.status === 429) {
+    return error.reason === 'identity_limit' ? 'identity_limit' : 'rate_limited'
+  }
+  if (error.status === 503) {
+    return error.reason === 'timeout' ? 'timeout' : 'queue_full'
+  }
+  return null
+}
+
+/** Returns true if the error represents an invalid evidence payload or format. */
+export function isInvalidEvidenceError(error: unknown): boolean {
+  if (error instanceof ApiClientError) {
+    return (
+      error.code === 'VALIDATION_ERROR' ||
+      error.code === 'PAYLOAD_TOO_LARGE' ||
+      error.code === 'UNSUPPORTED_MEDIA_TYPE' ||
+      (error.status >= 400 && error.status < 500 && error.status !== 429 && error.status !== 404)
+    )
+  }
+  if (error instanceof Error) {
+    const msg = error.message.toLowerCase()
+    return (
+      msg.includes('invalid evidence package') ||
+      msg.includes('metadata is required') ||
+      msg.includes('video is required') ||
+      msg.includes('unsupported') ||
+      msg.includes('payload exceeds')
+    )
+  }
+  return false
+}
+
+/**
+ * Parse an on-chain / Soroban RPC error and map it to an actionable message.
+ * Surfaces contract dispute errors (cooldown #66, cap #61, deadline #62, etc.).
+ */
+export function parseContractError(
+  error: unknown,
+  fallback = 'Transaction failed. Please check your inputs and try again.',
+): ActionableApiError {
+  const str =
+    error instanceof Error
+      ? error.message
+      : typeof error === 'string'
+        ? error
+        : JSON.stringify(error ?? '')
+
+  let matchedCode: BackendErrorCode | null = null
+
+  if (/Error\(Contract,\s*#?66\)|ContractError\(66\)|#66\b|\bReporterOnCooldown\b|cooldown/i.test(str)) {
+    matchedCode = 'REPORTER_ON_COOLDOWN'
+  } else if (/Error\(Contract,\s*#?61\)|ContractError\(61\)|#61\b|\bTooManyOpenDisputes\b|dispute\s*cap|open\s*dispute.*cap/i.test(str)) {
+    matchedCode = 'TOO_MANY_OPEN_DISPUTES'
+  } else if (/Error\(Contract,\s*#?62\)|ContractError\(62\)|#62\b|\bDisputeWindowExpired\b|deadline/i.test(str)) {
+    matchedCode = 'DISPUTE_WINDOW_EXPIRED'
+  } else if (/Error\(Contract,\s*#?65\)|ContractError\(65\)|#65\b|\bUnauthorizedResponder\b|unauthorized\s*responder/i.test(str)) {
+    matchedCode = 'UNAUTHORIZED_RESPONDER'
+  } else if (/Error\(Contract,\s*#?45\)|ContractError\(45\)|#45\b|\bDisputeNotFound\b|dispute\s*not\s*found/i.test(str)) {
+    matchedCode = 'DISPUTE_NOT_FOUND'
+  } else if (/Error\(Contract,\s*#?63\)|ContractError\(63\)|#63\b|\bDisputeAlreadyClosed\b|dispute\s*already\s*closed/i.test(str)) {
+    matchedCode = 'DISPUTE_ALREADY_CLOSED'
+  } else if (/Error\(Contract,\s*#?67\)|ContractError\(67\)|#67\b|\bInvalidDisputeTransition\b|invalid\s*dispute\s*transition/i.test(str)) {
+    matchedCode = 'INVALID_DISPUTE_TRANSITION'
+  }
+
+  if (matchedCode && matchedCode in CODE_GUIDANCE) {
+    const guidance = CODE_GUIDANCE[matchedCode as Exclude<BackendErrorCode, 'UNKNOWN'>]
+    return {
+      code: matchedCode,
+      message: guidance.fallbackMessage,
+      detail: sanitizeText(str),
+      requestId: null,
+      action: guidance.action,
+      retryable: guidance.retryable,
+      status: 400,
+    }
+  }
+
+  return {
+    code: 'UNKNOWN',
+    message: sanitizeText(str) || fallback,
+    detail: null,
+    requestId: null,
+    action: 'none',
+    retryable: false,
+    status: 400,
+  }
+}
+
+/**
+ * Format a contract error into a user-facing actionable error string.
+ */
+export function formatContractErrorMessage(
+  error: unknown,
+  fallback = 'Transaction failed. Please check your inputs and try again.',
+): string {
+  return parseContractError(error, fallback).message
+}
+

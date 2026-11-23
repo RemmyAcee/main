@@ -38,15 +38,19 @@ alias that expands to all three:
 Never gated by any pause: `get_proof`, `get_proof_status`, `get_by_video`,
 `has_nullifier`, `get_issuer`, `get_credential_root`, `get_verifier`,
 `is_paused`, `get_pause_state`, and the admin-remediation entry points
-listed above.
+listed above. Receipt-digest entry points are also deliberately ungated —
+`add_receipt_signer`, `revoke_receipt_signer`, `commit_receipt_digest`, and
+the receipt getters keep working while a registration pause is active, so
+auditors can anchor and inspect receipts for already-registered proofs
+during an incident (see `RECEIPT_COMMITMENT.md`).
 
 ## Roles And Authorization Matrix
 
-| Actor            | `pause`                          | `unpause` | `set_guardian` |
-|-------------------|----------------------------------|-----------|-----------------|
-| admin             | yes, up to `MAX_PAUSE_DURATION_SECS` (7 days) | yes | yes |
-| guardian          | yes, up to `MAX_GUARDIAN_PAUSE_DURATION_SECS` (24 hours) | no (`Unauthorized`, #3) | no (`Unauthorized`, #3) |
-| anyone else       | no (`Unauthorized`, #3)          | no (`Unauthorized`, #3) | no (`Unauthorized`, #3) |
+| Actor            | `pause`                          | `unpause` | `set_guardian` | `clear_guardian` |
+|-------------------|----------------------------------|-----------|-----------------|------------------|
+| admin             | yes, up to `MAX_PAUSE_DURATION_SECS` (7 days) | yes | yes | yes |
+| guardian          | yes, up to `MAX_GUARDIAN_PAUSE_DURATION_SECS` (24 hours) | no (`Unauthorized`, #3) | no (`Unauthorized`, #3) | no (`Unauthorized`, #3) |
+| anyone else       | no (`Unauthorized`, #3)          | no (`Unauthorized`, #3) | no (`Unauthorized`, #3) | no (`Unauthorized`, #3) |
 
 Only the admin can lift a pause early. A guardian can raise the alarm but
 cannot stand it down before the bounded expiry — that asymmetry is
@@ -54,7 +58,7 @@ intentional so a compromised guardian key cannot re-open a path the admin
 deliberately closed.
 
 There is no guardian by default. `set_guardian` is additive and optional;
-until the admin calls it, only the admin can pause.
+until the admin calls it (or after calling `clear_guardian`), only the admin can pause.
 
 ## State Machine
 
@@ -81,9 +85,9 @@ paused   --pause(caller, domain, duration)---> paused (expires_at overwritten/ex
 
 | Code | Name                  | When                                                        |
 |------|------------------------|--------------------------------------------------------------|
-| 13   | `Paused`               | A registration call hit a domain with an unexpired pause.    |
-| 14   | `InvalidPauseDomain`   | `domain` was `0` or contained bits outside the known set.    |
-| 15   | `InvalidPauseDuration` | `duration_secs` was `0` or exceeded the caller's role cap.   |
+| 21   | `Paused`               | A registration call hit a domain with an unexpired pause.    |
+| 22   | `InvalidPauseDomain`   | `domain` was `0` or contained bits outside the known set.    |
+| 23   | `InvalidPauseDuration` | `duration_secs` was `0` or exceeded the caller's role cap.   |
 
 ## Event Schema
 
@@ -95,6 +99,7 @@ or signature material is ever included.
 ["pause", "set", domain]      => paused_by, paused_at, expires_at
 ["pause", "clear", domain]    => unpaused_by, unpaused_at
 ["guardian", "set", guardian] => {}
+["guardian", "clear"]         => {}
 ```
 
 Natural (automatic) expiry does not itself emit an event, since no
@@ -115,7 +120,7 @@ existing signatures and error codes.
 ### Rollback
 
 Rolling back to a pre-#87 wasm build simply drops the `pause`/`unpause`/
-`set_guardian`/`is_paused`/`get_pause_state`/`get_guardian` entry points;
+`set_guardian`/`clear_guardian`/`is_paused`/`get_pause_state`/`get_guardian` entry points;
 the `Guardian`/`Pause(domain)` storage entries become inert and are ignored
 by the older contract code. There is no data to clean up and no forward
 dependency — rollback is a plain wasm redeploy.
@@ -148,21 +153,21 @@ No new deployment step is required. To use the feature after upgrading:
 
 ## Troubleshooting
 
-- **`Error(Contract, #13)` (`Paused`) on a register call**: expected —
+- **`Error(Contract, #21)` (`Paused`) on a register call**: expected —
   that tier's registration is currently paused. Call `is_paused` for the
   relevant domain, or `get_pause_state` for the exact `expires_at`, to see
   when it lifts (or have the admin `unpause` early).
-- **`Error(Contract, #14)` (`InvalidPauseDomain`)**: the `domain` argument
+- **`Error(Contract, #22)` (`InvalidPauseDomain`)**: the `domain` argument
   was `0` or included bits outside `PAUSE_DOMAIN_TIER1_REGISTRATION |
   PAUSE_DOMAIN_TIER2_REGISTRATION | PAUSE_DOMAIN_TIER3_REGISTRATION`.
   `get_pause_state` additionally requires a single bit, not a composite.
-- **`Error(Contract, #15)` (`InvalidPauseDuration`)**: `duration_secs` was
+- **`Error(Contract, #23)` (`InvalidPauseDuration`)**: `duration_secs` was
   `0`, or exceeded `MAX_PAUSE_DURATION_SECS` (admin) /
   `MAX_GUARDIAN_PAUSE_DURATION_SECS` (guardian). Guardians who need a
   longer pause should escalate to the admin.
-- **Guardian call to `unpause` or `set_guardian` fails with
+- **Guardian call to `unpause`, `set_guardian`, or `clear_guardian` fails with
   `Error(Contract, #3)` (`Unauthorized`)**: by design — only the admin can
-  lift a pause or change the guardian.
+  lift a pause or configure/clear the guardian.
 - **Pause "isn't lifting"**: pauses lift automatically once
   `ledger().timestamp() >= expires_at`; `get_pause_state` may still return a
   stale record after that point until an explicit `unpause` clears it, but
@@ -171,8 +176,10 @@ No new deployment step is required. To use the feature after upgrading:
 ## Limitations
 
 - Pause is scoped to the four registration entry points only. It does not
-  gate issuer/credential-root management or `revoke_proof`, by design (those
-  are the tools used to contain and clean up during an incident).
+  gate issuer/credential-root management, `revoke_proof`, or the receipt
+  digest entry points (`add_receipt_signer`, `revoke_receipt_signer`,
+  `commit_receipt_digest`), by design (those are the tools used to contain,
+  clean up, and audit during an incident).
 - There is a single guardian slot, not a list — rotate it with
   `set_guardian` rather than trying to run multiple guardians.
 - Pause state is public (`is_paused`, `get_pause_state` take no auth), so it
