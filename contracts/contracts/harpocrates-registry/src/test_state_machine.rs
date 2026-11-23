@@ -44,7 +44,7 @@ struct MockStateMachineVerifier;
 impl MockStateMachineVerifier {
     pub fn verify_proof(_env: Env, public_inputs: Bytes, proof: Bytes) {
         let len = public_inputs.len();
-        if (len != 128 && len != 192) || proof.is_empty() {
+        if !(matches!(len, 128 | 160 | 224 | 256)) || proof.is_empty() {
             panic!("invalid state-machine proof");
         }
     }
@@ -278,6 +278,7 @@ struct Model {
     verifier: Option<u8>,
     proof_ttl: u64,
     revocation_root: Option<u8>,
+    revocation_roots: StdVec<u8>,
     now: u64,
     schema_version: u32,
     proofs: StdVec<ModelProof>,
@@ -309,8 +310,9 @@ impl Model {
             verifier: None,
             proof_ttl: 0,
             revocation_root: None,
+            revocation_roots: StdVec::new(),
             now: START_TIMESTAMP,
-            schema_version: 1,
+            schema_version: 2,
             proofs: StdVec::new(),
             nullifiers: StdVec::new(),
         }
@@ -321,6 +323,14 @@ impl Model {
             Ok(())
         } else {
             Err(RegistryError::Unauthorized)
+        }
+    }
+
+    fn require_issuer_role_available(&self, issuer: ActorId) -> Result<(), RegistryError> {
+        if issuer == self.admin || self.pending_admin == Some(issuer) {
+            Err(RegistryError::RoleConflict)
+        } else {
+            Ok(())
         }
     }
 
@@ -564,11 +574,14 @@ fn silent_public_inputs(
             credential_root.copy_into_slice(&mut cr);
             nullifier.copy_into_slice(&mut nu);
 
-            let mut bytes = [0u8; 128];
+            let mut bytes = [0u8; 160];
             bytes[16..32].copy_from_slice(&vh[..16]);
             bytes[48..64].copy_from_slice(&vh[16..]);
             bytes[64..96].copy_from_slice(&cr);
             bytes[96..128].copy_from_slice(&nu);
+            let mut domain = [0u8; 32];
+            expected_domain_tag(env).copy_into_slice(&mut domain);
+            bytes[128..160].copy_from_slice(&domain);
             Bytes::from_array(env, &bytes)
         }
     }
@@ -818,7 +831,7 @@ fn apply_command(fixture: &Fixture, model: &mut Model, command: Command) -> Chec
                 "register_source",
             )? {
                 model.proofs.push(record);
-                2
+                3
             } else {
                 0
             }
@@ -863,7 +876,7 @@ fn apply_command(fixture: &Fixture, model: &mut Model, command: Command) -> Chec
                 "register_seal",
             )? {
                 model.proofs.push(record);
-                2
+                3
             } else {
                 0
             }
@@ -931,7 +944,7 @@ fn apply_command(fixture: &Fixture, model: &mut Model, command: Command) -> Chec
             )? {
                 model.nullifiers.push(slot(nullifier));
                 model.proofs.push(record);
-                2
+                3
             } else {
                 0
             }
@@ -1006,7 +1019,7 @@ fn apply_command(fixture: &Fixture, model: &mut Model, command: Command) -> Chec
             )? {
                 model.nullifiers.push(slot(nullifier));
                 model.proofs.push(record);
-                2
+                3
             } else {
                 0
             }
@@ -1047,7 +1060,9 @@ fn apply_command(fixture: &Fixture, model: &mut Model, command: Command) -> Chec
             issuer,
             metadata,
         } => {
-            let expected = model.require_admin(admin);
+            let expected = model
+                .require_admin(admin)
+                .and_then(|_| model.require_issuer_role_available(issuer));
 
             let mut call_args = args(fixture);
             call_args.push_back(fixture.actor(admin).into_val(&fixture.env));
@@ -1196,7 +1211,21 @@ fn apply_command(fixture: &Fixture, model: &mut Model, command: Command) -> Chec
             admin,
             pending_admin,
         } => {
-            let expected = model.require_admin(admin);
+            let expected = model
+                .require_admin(admin)
+                .and_then(|_| {
+                    if model.issuers[pending_admin.index()] == IssuerState::Active {
+                        Err(RegistryError::RoleConflict)
+                    } else if let Some(existing) = model.pending_admin {
+                        if existing == pending_admin {
+                            Ok(())
+                        } else {
+                            Err(RegistryError::RoleConflict)
+                        }
+                    } else {
+                        Ok(())
+                    }
+                });
 
             let mut call_args = args(fixture);
             call_args.push_back(fixture.actor(admin).into_val(&fixture.env));
@@ -1244,6 +1273,9 @@ fn apply_command(fixture: &Fixture, model: &mut Model, command: Command) -> Chec
                 Some(expected_admin) if expected_admin != pending_admin => {
                     Err(RegistryError::Unauthorized)
                 }
+                Some(_) if model.issuers[pending_admin.index()] == IssuerState::Active => {
+                    Err(RegistryError::RoleConflict)
+                }
                 Some(_) => Ok(()),
             };
 
@@ -1278,7 +1310,13 @@ fn apply_command(fixture: &Fixture, model: &mut Model, command: Command) -> Chec
                 "set_revocation_root",
             )?;
             if expected.is_ok() {
-                model.revocation_root = Some(slot(root));
+                let s = slot(root);
+                model.revocation_root = Some(s);
+                model.revocation_roots.retain(|&r| r != s);
+                while model.revocation_roots.len() >= MAX_REVOCATION_ROOT_HISTORY as usize {
+                    model.revocation_roots.remove(0);
+                }
+                model.revocation_roots.push(s);
                 1
             } else {
                 0
@@ -1299,7 +1337,7 @@ fn apply_command(fixture: &Fixture, model: &mut Model, command: Command) -> Chec
                 RevocationInputMode::Correct | RevocationInputMode::WrongRoot => {
                     if model.revocation_root.is_none() {
                         Err(RegistryError::NotInitialized)
-                    } else if Some(slot(revocation_root)) != model.revocation_root
+                    } else if !model.revocation_roots.contains(&slot(revocation_root))
                         || input_mode == RevocationInputMode::WrongRoot
                     {
                         Err(RegistryError::InvalidPublicInputs)
@@ -1370,11 +1408,11 @@ fn apply_command(fixture: &Fixture, model: &mut Model, command: Command) -> Chec
                 expected,
                 "upgrade_storage",
             )?;
+            let migrated = expected.is_ok() && model.schema_version < SchemaVersion::V2 as u32;
             if expected.is_ok() {
-                let target_version = 1;
-                if model.schema_version < target_version {
-                    model.schema_version = target_version;
-                }
+                model.schema_version = SchemaVersion::V2 as u32;
+            }
+            if migrated {
                 1
             } else {
                 0
@@ -1492,7 +1530,7 @@ fn assert_storage_matches_model(fixture: &Fixture, model: &Model) -> CheckResult
     }
 
     for nullifier in 0..KEY_POOL {
-        let actual = client.has_nullifier(&key(&fixture.env, HashDomain::Nullifier, nullifier));
+        let actual = client.has_nullifier(&client.get_verifier().unwrap(), &key(&fixture.env, HashDomain::Nullifier, nullifier));
         let expected = model.nullifier_exists(nullifier);
         if actual != expected {
             return Err(format!(

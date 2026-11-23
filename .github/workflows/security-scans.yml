@@ -9,6 +9,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/tags/') }}
+
 jobs:
   secret-scan:
     name: TruffleHog Secret Scan
@@ -26,6 +30,14 @@ jobs:
           base: ${{ github.event.repository.default_branch }}
           head: HEAD
           extra_args: --debug --only-verified
+
+      - name: Setup Python for custom scanner
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Harpocrates Secret Scanner
+        run: python devx/secret_scanner.py
 
   dependency-scan:
     name: Dependency Vulnerability Checks
@@ -67,3 +79,37 @@ jobs:
       - name: cargo audit (Contracts)
         working-directory: contracts
         run: cargo audit
+
+  container-scan:
+    name: Deployment Container Non-Root Checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Setup Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Validate Deployment Containers
+        run: python3 devx/validate_deployment_containers.py --check
+
+  markdown-link-check:
+    name: Markdown Link & Anchor Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Setup Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Check Relative Markdown Links
+        run: python3 devx/check_markdown_links.py
+
+      - name: Run Markdown Link Checker Unit Tests
+        run: python3 -m unittest devx/test_check_markdown_links.py -v
+

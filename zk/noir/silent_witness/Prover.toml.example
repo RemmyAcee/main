@@ -7,6 +7,8 @@ video_hash_hi = "1"
 video_hash_lo = "2"
 credential_root = "0"
 nullifier = "0"
+# Verifier scope identifier — must be a canonical decimal field element
+# (no whitespace, leading zeros, or hex prefix).
 verifier_scope = "0"
 epoch = "0"
 
@@ -15,4 +17,9 @@ epoch = "0"
 # Computed by the silent_witness_helper circuit; do not set manually.
 # A mismatch here will cause the in-circuit assert "domain tag mismatch" to fire.
 domain_tag = "0"
+
+# Circuit version committed to the proof envelope (#368). Must equal
+# CURRENT_CIRCUIT_VERSION in src/main.nr; a downgrade fails the in-circuit
+# assert "circuit version mismatch".
+circuit_version = "2"
 
