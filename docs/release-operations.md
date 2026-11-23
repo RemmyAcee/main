@@ -47,6 +47,32 @@ crypto-domain, metadata, and digest outcomes. Digest drift is reported as
 artifact pins are refreshed. Use `--strict` when digests must match exactly.
 The report never includes media, witnesses, credentials, proofs, or secrets.
 
+## Offline release review bundle
+
+Reviewers can collect compatibility, artifact verification, and API schema
+results into one offline bundle without network access or production
+credentials:
+
+```bash
+python3 devx/release_review_bundle.py --stable --check
+python3 devx/release_review_bundle.py --stable --write --output release/release-review-bundle.json
+python3 devx/release_review_bundle.py --stable --verify-existing --check
+python3 -m unittest discover -s devx -p 'test_release_review_bundle.py' -v
+```
+
+The bundle at [`release/release-review-bundle.json`](../release/release-review-bundle.json)
+records SHA-256 digests for the manifest, each declared artifact, every source
+used by the compatibility and schema checks, and the generated schema. Each
+result section reports `pass` or `fail`, and every failed or skipped check is
+listed explicitly in `missing_evidence` with `check`, `reason`, and `detail`.
+
+A skipped check is never normalized into a successful gate: any missing
+evidence or non-passing section sets top-level `status` to `fail`, and `--check`
+exits 1. Use `--write --stable` only to refresh the checked-in snapshot and
+`--verify-existing` to detect a stale one. The bundle contains only public
+release identity, versions, interface bindings, check outcomes, and digests; it
+never includes media, witnesses, credentials, proofs, or secrets.
+
 ## C2PA Interoperability & Bounded Parser
 
 External C2PA manifests entering Harpocrates boundaries are parsed using the bounded parser (`devx/c2pa_parser.py` and `devx/validate_c2pa_manifests.py`).
