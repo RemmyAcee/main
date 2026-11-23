@@ -51,13 +51,26 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 VALIDATION_ERROR = "VALIDATION_ERROR"
-"""Client-supplied data failed validation (400)."""
+MALFORMED_INPUT = "MALFORMED_INPUT"
+OVERSIZED_INPUT = "OVERSIZED_INPUT"
+UNSUPPORTED_INPUT = "UNSUPPORTED_INPUT"
+classify_cli_error = lambda x: x
+"""Legacy client-validation code retained for compatibility (400)."""
 
 PAYLOAD_TOO_LARGE = "PAYLOAD_TOO_LARGE"
-"""Request body exceeds the configured size limit (413)."""
+"""Legacy payload-limit code retained for compatibility (413)."""
+
+UPLOAD_TERMINATED_PREMATURELY = "UPLOAD_TERMINATED_PREMATURELY"
+"""The client disconnected or the upload stream ended before completion (400)."""
+
+STEGO_LIMIT_EXCEEDED = "STEGO_LIMIT_EXCEEDED"
+"""Steganography processing exceeded configured memory or CPU limits (413)."""
 
 NOT_FOUND = "NOT_FOUND"
 """The requested resource or capability is unavailable (404)."""
+
+GONE = "GONE"
+"""The requested resource has been purged and is no longer available (410)."""
 
 INTERNAL_ERROR = "INTERNAL_ERROR"
 """An unexpected server-side failure occurred (500)."""
@@ -67,6 +80,28 @@ UNSUPPORTED_MEDIA_TYPE = "UNSUPPORTED_MEDIA_TYPE"
 
 RATE_LIMITED = "RATE_LIMITED"
 """The client exceeded a per-client request budget (429)."""
+
+FORBIDDEN = "FORBIDDEN"
+"""The credential is valid but not authorized for this proof owner (403)."""
+
+DEPENDENCY_UNAVAILABLE = "DEPENDENCY_UNAVAILABLE"
+"""A required backing service failed; the request was rejected, not applied (503)."""
+
+STORAGE_QUOTA_EXHAUSTED = "STORAGE_QUOTA_EXHAUSTED"
+"""Storage capacity or configured byte quota is exhausted; retryable operational condition (507)."""
+
+EVIDENCE_CORRUPTED = "EVIDENCE_CORRUPTED"
+"""Stored evidence failed cryptographic authentication or digest verification (422)."""
+
+STORAGE_IO_UNAVAILABLE = "STORAGE_IO_UNAVAILABLE"
+"""A non-quota, non-corruption storage I/O error occurred; retryable operational condition (503)."""
+
+FORBIDDEN_ORIGIN = "FORBIDDEN_ORIGIN"
+"""The request's Origin is not on the configured CORS allow-list (403).
+
+The offending origin value is intentionally absent from the envelope: error
+payloads must stay privacy-safe and must not echo attacker-controlled input.
+"""
 
 # ---------------------------------------------------------------------------
 # Public helpers
@@ -79,8 +114,14 @@ def error_response(
     message: str,
     status: int,
     field: str | None = None,
+    cli_code: str | None = None,
 ) -> tuple[Response, int]:
     """Return a Flask response tuple for a standardized error envelope.
+
+    The legacy ``code`` value remains the stable public contract for compatible
+    callers. A second ``cli_code`` field is added for CLI and automation tooling
+    that needs a lowercase, shell-friendly identifier without breaking existing
+    integrations.
 
     Args:
         code: Machine-readable error code (one of the module-level constants,
@@ -107,6 +148,42 @@ def error_response(
         ),
         status,
     )
+
+
+LINEAGE_LIMIT_MIN = 1
+"""Minimum accepted ``limit`` for lineage list endpoints."""
+
+LINEAGE_LIMIT_MAX = 1000
+"""Maximum accepted ``limit`` for lineage list endpoints."""
+
+
+def clamp_lineage_limit(value: Any) -> int:
+    """Validate and clamp a lineage list ``limit`` query parameter.
+
+    Mirrors :func:`clamp_proof_events_limit` semantics for the lineage
+    endpoints: non-integer values raise :class:`ValueError`, and integer
+    values are clamped into ``[LINEAGE_LIMIT_MIN, LINEAGE_LIMIT_MAX]``.
+
+    Args:
+        value: Raw query-string value (typically ``request.args.get("limit")``).
+
+    Returns:
+        The clamped integer limit.
+
+    Raises:
+        ValueError: If *value* is not an integer (including ``None``).
+    """
+    if value is None:
+        raise ValueError("limit must be an integer")
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("limit must be an integer") from exc
+    if parsed < LINEAGE_LIMIT_MIN:
+        return LINEAGE_LIMIT_MIN
+    if parsed > LINEAGE_LIMIT_MAX:
+        return LINEAGE_LIMIT_MAX
+    return parsed
 
 
 def ok_response(

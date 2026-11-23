@@ -160,6 +160,41 @@ describe('parseManifest', () => {
       expect(parsed.protocol).toBe('harpocrates')
     }
   })
+
+  it('preserves unknown optional extensions on round-trip without affecting identity fields', () => {
+    const current = createProofManifest(VALID_INPUT)
+    const withExt = { ...current, extensions: { 'x-audit-note': 'synthetic', 'x-rank': 7 } }
+    const parsed = parseManifest(JSON.stringify(withExt)) as ProofManifest & { extensions?: Record<string, unknown> }
+    expect(parsed.extensions).toEqual({ 'x-audit-note': 'synthetic', 'x-rank': 7 })
+    expect(parsed.proofId).toBe(current.proofId)
+    expect(parsed.videoHash).toBe(current.videoHash)
+    expect(parsed.tier).toBe(current.tier)
+  })
+
+  it('rejects unsupported required extension semantics', () => {
+    const current = createProofManifest(VALID_INPUT)
+    expect(() =>
+      parseManifest(JSON.stringify({ ...current, requiredExtensions: ['x-unknown-critical'] })),
+    ).toThrow('unsupported required extension')
+  })
+})
+
+describe('createProofManifest — golden serialization', () => {
+  it('produces the canonical serialized string for a fixed input', () => {
+    const manifest = createProofManifest(VALID_INPUT)
+    const expected =
+      '{"contractId":"CAAAAAAAAABCD1234567890ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890","epoch":0,"metadataHash":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","network":"Test SDF Network ; September 2015","proofId":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","protocol":"harpocrates","sourceHash":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","tier":"silent","timestamp":"2026-07-24T12:00:00.000Z","transactionRef":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","verifierScope":"0","version":2,"videoHash":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}'
+    expect(serializeManifest(manifest)).toBe(expected)
+  })
+
+  it('keeps key ordering stable and deterministic across calls', () => {
+    const manifest = createProofManifest(VALID_INPUT)
+    const first = serializeManifest(manifest)
+    const second = serializeManifest(createProofManifest(VALID_INPUT))
+    expect(first).toBe(second)
+    const keys = Object.keys(JSON.parse(first) as ProofManifest)
+    expect(keys).toEqual([...keys].sort())
+  })
 })
 
 describe('createProofManifest — boundary and regression', () => {

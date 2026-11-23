@@ -4,21 +4,28 @@ import base64
 import binascii
 import hashlib
 import logging
+import re
 import os
+import threading
 import time
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timedelta, timezone
 from typing import Any, Iterator
 
 import psycopg
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
+from tracing import job_trace_context, span
 
 logger = logging.getLogger(__name__)
 
 # Max page size for GET /api/proofs cursor pagination.
 PROOF_EVENTS_MAX_LIMIT = 100
 PROOF_EVENTS_DEFAULT_LIMIT = 25
+# Default retention page size, used when a caller does not pass one.
+RETENTION_BATCH_DEFAULT_SIZE = 100
+# Upper bound for a retention page; must match config.RETENTION_BATCH_SIZE_MAX.
+RETENTION_BATCH_MAX_SIZE = 5000
 
 # Libpq / Postgres connection-class SQLSTATEs that are typically transient on
 # Neon (cold start, compute wake, brief network blips, pooler pressure).
@@ -58,6 +65,32 @@ _TRANSIENT_MESSAGE_FRAGMENTS = (
     "couldn't connect to compute",
     "error connecting to compute node",
 )
+
+# Diagnostic bounds for worker exception text persisted on job failure.
+JOB_ERROR_MAX_BYTES = 2048
+_JOB_ERROR_REDACTED = "[redacted]"
+_PRIVATE_PATH_RE = re.compile(r"(?:/(?:home|Users|root|tmp|var|srv|opt|etc)/[^\s'\"]*)")
+_SECRET_SHAPED_RE = re.compile(
+    r"(?i)((?:password|passwd|secret|token|api[_-]?key|authorization|bearer)\s*[=:]?\s*)\S+"
+)
+_LONG_HEX_RE = re.compile(r"\b[0-9a-fA-F]{40,}\b")
+
+
+def sanitize_job_error(error: object) -> str:
+    """Return a bounded, redacted diagnostic string for job-failure storage.
+
+    Strips private filesystem paths and secret-shaped values and caps the
+    result at ``JOB_ERROR_MAX_BYTES`` UTF-8 bytes so arbitrary exception text
+    cannot bloat storage or leak credentials.
+    """
+    text = str(error) if error is not None else ""
+    text = _PRIVATE_PATH_RE.sub(_JOB_ERROR_REDACTED, text)
+    text = _SECRET_SHAPED_RE.sub(lambda m: m.group(1) + _JOB_ERROR_REDACTED, text)
+    text = _LONG_HEX_RE.sub(_JOB_ERROR_REDACTED, text)
+    encoded = text.encode("utf-8")
+    if len(encoded) > JOB_ERROR_MAX_BYTES:
+        text = encoded[:JOB_ERROR_MAX_BYTES].decode("utf-8", errors="ignore")
+    return text
 
 
 def encode_proof_events_cursor(event_id: int) -> str:
@@ -233,15 +266,16 @@ def get_connection() -> Iterator[psycopg.Connection]:
     ``DB_CONNECT_TIMEOUT_SECONDS`` per try and ``DB_CONNECT_DEADLINE_SECONDS``
     overall so readiness / request paths stay bounded.
     """
-    url = database_url()
-    if not url:
-        raise RuntimeError("DATABASE_URL is not configured")
+    with span("db.connection", attributes={"db.system.name": "postgresql"}):
+        url = database_url()
+        if not url:
+            raise RuntimeError("DATABASE_URL is not configured")
 
-    connection = _connect_with_retry(url)
-    try:
-        yield connection
-    finally:
-        connection.close()
+        connection = _connect_with_retry(url)
+        try:
+            yield connection
+        finally:
+            connection.close()
 
 
 def init_db() -> None:
@@ -249,10 +283,38 @@ def init_db() -> None:
 
     This replaces the earlier inline ``CREATE TABLE IF NOT EXISTS`` approach
     with an ordered, auditable migration ledger.  Safe to call repeatedly.
+
+    Before any pending migration is applied, the recorded checksum of every
+    already-applied migration is replayed against its in-code definition; a
+    mismatch raises ``migration.MigrationChecksumError`` so a drifted ledger
+    cannot silently start serving traffic.  Set
+    ``MIGRATION_CHECKSUM_ENFORCEMENT=warn`` only as a temporary break-glass
+    rollback while the ledger is reconciled.
     """
     from migration import run_migrations  # late import to avoid cycles
 
     run_migrations()
+
+
+def verify_migration_checksums() -> list[dict[str, object]]:
+    """Return applied migrations whose recorded checksum no longer matches.
+
+    Each dict has keys ``migration_id``, ``name``, ``issue``, ``expected`` and
+    ``recorded``.  An empty list means every applied migration is intact.
+    Read-only; intended for startup diagnostics and operational tooling.
+    """
+    from migration import verify_migration_checksums as _verify
+
+    return [
+        {
+            "migration_id": issue.migration_id,
+            "name": issue.name,
+            "issue": issue.issue,
+            "expected": issue.expected,
+            "recorded": issue.recorded,
+        }
+        for issue in _verify()
+    ]
 
 
 def detect_drift() -> list[dict[str, str]]:
@@ -428,9 +490,11 @@ def insert_proof_event(
                     contract_id,
                     retention_class,
                     expires_at,
-                    metadata
+                    metadata,
+                    time_attestation,
+                    claimed_capture_time
                 )
-                values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 returning id, created_at;
                 """,
                 (
@@ -538,9 +602,101 @@ def list_proof_events(
     return rows, next_cursor
 
 
-def find_proof_events_by_video(video_hash: str) -> list[dict[str, Any]]:
+def find_proof_events_by_video(
+    video_hash: str,
+    limit: int = PROOF_EVENTS_DEFAULT_LIMIT,
+    *,
+    cursor_id: int | None = None,
+) -> tuple[list[dict[str, Any]], str | None]:
     if not database_url():
-        return []
+        return [], None
+
+    page_size = clamp_proof_events_limit(limit)
+    fetch_size = page_size + 1
+
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            if cursor_id is None:
+                cursor.execute(
+                    """
+                    select
+                        id,
+                        event_type,
+                        file_name,
+                        video_hash,
+                        metadata_hash,
+                        proof_id,
+                        tier,
+                        embedded_hash,
+                        tx_hash,
+                        tx_status,
+                        source_address,
+                        contract_id,
+                        retention_class,
+                        expires_at,
+                        legal_hold,
+                        metadata,
+                        time_attestation,
+                        claimed_capture_time,
+                        created_at
+                    from proof_events
+                    where video_hash = %s
+                    order by id desc
+                    limit %s;
+                    """,
+                    (video_hash, fetch_size),
+                )
+            else:
+                cursor.execute(
+                    """
+                    select
+                        id,
+                        event_type,
+                        file_name,
+                        video_hash,
+                        metadata_hash,
+                        proof_id,
+                        tier,
+                        embedded_hash,
+                        tx_hash,
+                        tx_status,
+                        source_address,
+                        contract_id,
+                        retention_class,
+                        expires_at,
+                        legal_hold,
+                        metadata,
+                        time_attestation,
+                        claimed_capture_time,
+                        created_at
+                    from proof_events
+                    where video_hash = %s
+                      and id < %s
+                    order by id desc
+                    limit %s;
+                    """,
+                    (video_hash, cursor_id, fetch_size),
+                )
+            rows = [dict(row) for row in cursor.fetchall()]
+
+    next_cursor: str | None = None
+    if len(rows) > page_size:
+        rows = rows[:page_size]
+        next_cursor = encode_proof_events_cursor(int(rows[-1]["id"]))
+    return rows, next_cursor
+
+
+def find_proof_events_by_proof_id(proof_id: str) -> list[dict[str, Any]]:
+    if not database_url():
+        rows = [
+            dict(r) for r in _INDEXED_EVENTS.values() if r.get("proof_id") == proof_id
+        ]
+        rows.sort(key=lambda r: (
+            r.get("ledger") if r.get("ledger") is not None else float("inf"),
+            r.get("event_index") if r.get("event_index") is not None else float("inf"),
+            r.get("tx_hash") or "",
+        ))
+        return rows
 
     with get_connection() as connection:
         with connection.cursor() as cursor:
@@ -565,14 +721,49 @@ def find_proof_events_by_video(video_hash: str) -> list[dict[str, Any]]:
                     metadata,
                     time_attestation,
                     claimed_capture_time,
+                    event_index,
+                    ledger,
                     created_at
                 from proof_events
-                where video_hash = %s
-                order by id desc;
+                where proof_id = %s
+                order by ledger asc nulls last,
+                         event_index asc nulls last,
+                         tx_hash asc nulls last,
+                         id asc;
                 """,
-                (video_hash,),
+                (proof_id,),
             )
             return [dict(row) for row in cursor.fetchall()]
+
+
+def find_proof_owner(proof_id: str) -> str | None:
+    """Return the ``source_address`` that first registered ``proof_id``.
+
+    The earliest register event with a recorded address is authoritative, so a
+    later event cannot re-assign ownership. Returns ``None`` when the proof is
+    unknown, was registered without an address, or no database is configured
+    (the same stub behaviour as :func:`upsert_register_event`). Database errors
+    propagate so callers can fail closed instead of guessing.
+    """
+    if not database_url():
+        return None
+
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                select source_address
+                from proof_events
+                where proof_id = %s
+                  and event_type = 'register'
+                  and source_address is not null
+                order by id asc
+                limit 1;
+                """,
+                (proof_id,),
+            )
+            row = cursor.fetchone()
+    return row["source_address"] if row else None
 
 
 def make_idempotency_key(video_hash: str, proof_id: str, tx_hash: str | None) -> str:
@@ -871,20 +1062,67 @@ def list_proof_history_events(
             )
             return [dict(row) for row in cursor.fetchall()]
 
-def update_tx_status(tx_hash: str, status: str) -> None:
+def list_pending_registration_txs(limit: int = 50) -> list[dict[str, Any]]:
+    """Return pending registration rows that still need on-chain reconciliation."""
     if not database_url():
-        return
+        return []
+    page_size = max(1, min(int(limit), 50))
     with get_connection() as connection:
         with connection.cursor() as cursor:
             cursor.execute(
                 """
-                update proof_events
-                set tx_status = %s
-                where tx_hash = %s;
+                select id, proof_id, tx_hash, tx_status, contract_id, created_at
+                from proof_events
+                where tx_hash is not null
+                  and tx_status = 'pending'
+                order by id asc
+                limit %s;
                 """,
-                (status, tx_hash)
+                (page_size,),
             )
+            return [dict(row) for row in cursor.fetchall()]
+
+
+def update_tx_status(tx_hash: str, status: str, *, force: bool = False) -> bool:
+    """Persist a reconciled tx status.
+
+    By default only transitions rows that are still ``pending`` so terminal
+    confirmations are idempotent and concurrent workers do not clobber each
+    other. Pass ``force=True`` to overwrite a terminal status (repair path).
+
+    Returns True when at least one row was updated.
+    """
+    if not database_url():
+        return False
+    if not isinstance(tx_hash, str) or not tx_hash.strip():
+        return False
+    if status not in {"pending", "confirmed", "failed", "missing"}:
+        raise ValueError("tx status must be pending, confirmed, failed, or missing")
+
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            if force:
+                cursor.execute(
+                    """
+                    update proof_events
+                    set tx_status = %s
+                    where tx_hash = %s;
+                    """,
+                    (status, tx_hash),
+                )
+            else:
+                cursor.execute(
+                    """
+                    update proof_events
+                    set tx_status = %s
+                    where tx_hash = %s
+                      and (tx_status is null or tx_status = 'pending');
+                    """,
+                    (status, tx_hash),
+                )
+            updated = cursor.rowcount > 0
         connection.commit()
+    return updated
 
 
 def set_legal_hold(proof_id: str, hold: bool) -> None:
@@ -904,7 +1142,34 @@ def set_legal_hold(proof_id: str, hold: bool) -> None:
         connection.commit()
 
 
-def purge_expired_events() -> list[dict[str, Any]]:
+# Single source of truth for retention eligibility. Shared by the dry-run count
+# and the real purge so the two can never diverge.
+EXPIRED_EVENTS_PREDICATE_SQL = (
+    "expires_at is not null and expires_at <= now() and legal_hold = false"
+)
+
+
+def count_expired_events() -> int:
+    """Return how many proof events ``purge_expired_events`` would delete.
+
+    Read-only; uses the same filter as the purge so retention dry runs match.
+    """
+    if not database_url():
+        return 0
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                f"""
+                select count(*) as expired
+                from proof_events
+                where {EXPIRED_EVENTS_PREDICATE_SQL};
+                """
+            )
+            row = cursor.fetchone()
+    return int(row["expired"]) if row else 0
+
+
+def purge_expired_events(batch_size: int = RETENTION_BATCH_DEFAULT_SIZE) -> list[dict[str, Any]]:
     """Delete proof events past their expiration that are not on legal hold.
 
     Returns a list of deletion receipts (proof_id, deleted_at, etc.) for
@@ -912,59 +1177,214 @@ def purge_expired_events() -> list[dict[str, Any]]:
     """
     if not database_url():
         return []
-    now = datetime.now(timezone.utc)
-    receipts: list[dict[str, Any]] = []
+    batch_size = max(1, min(batch_size, RETENTION_BATCH_MAX_SIZE))
     with get_connection() as connection:
         with connection.cursor() as cursor:
             cursor.execute(
-                """
-                select id, proof_id, video_hash, metadata_hash,
-                       retention_class, tier
-                from proof_events
-                where expires_at is not null
-                  and expires_at <= %s
-                  and legal_hold = false;
+                f"""
+                with expired as (
+                    select id, proof_id, video_hash, metadata_hash
+                    from proof_events
+                    where {EXPIRED_EVENTS_PREDICATE_SQL}
+                    order by id
+                    limit %s
+                    for update skip locked
+                ), deleted as (
+                    delete from proof_events
+                    using expired
+                    where proof_events.id = expired.id
+                    returning proof_events.id, proof_events.proof_id,
+                              proof_events.video_hash, proof_events.metadata_hash
+                )
+                insert into deletion_receipts (event_id, proof_id, video_hash, metadata_hash)
+                select id, proof_id, video_hash, metadata_hash
+                from deleted
+                returning id, event_id, proof_id, video_hash, metadata_hash, deleted_at;
                 """,
-                (now,),
+                (batch_size,),
             )
-            expired = [dict(row) for row in cursor.fetchall()]
-            for event in expired:
-                cursor.execute(
-                    """
-                    insert into deletion_receipts (proof_id, video_hash, metadata_hash)
-                    values (%s, %s, %s)
-                    returning id, created_at;
-                    """,
-                    (event["proof_id"], event.get("video_hash"), event.get("metadata_hash")),
-                )
-                receipt = cursor.fetchone()
-                if receipt:
-                    receipts.append(dict(receipt))
-                cursor.execute(
-                    "delete from proof_events where id = %s;",
-                    (event["id"],),
-                )
+            receipts = [dict(row) for row in cursor.fetchall()]
         connection.commit()
     return receipts
 
 
 _JOBS: dict[int, dict[str, Any]] = {}
+# Guards check-then-write on job records: a worker's main loop (deadlines) and
+# its work thread (completion) can touch the same job concurrently.
+_JOBS_LOCK = threading.RLock()
+
+# Terminal reasons set when a processing deadline closes a job.
+JOB_QUEUE_EXPIRED = "queue_expired"
+JOB_EXECUTION_TIMEOUT = "execution_timeout"
+_DEADLINE_REASONS = frozenset({JOB_QUEUE_EXPIRED, JOB_EXECUTION_TIMEOUT})
 _next_job_id = 1
+_TENANT_LAST_LEASED_SEQ: dict[str, int] = {}
+_lease_seq = 0
+
+EXPENSIVE_VIDEO_JOB_TYPES = frozenset({"embed", "extract"})
+DEFAULT_TENANT_ID = "default"
+DEFAULT_MAX_CONCURRENT_VIDEO_JOBS_PER_TENANT = 2
+DEFAULT_MAX_QUEUED_VIDEO_JOBS_PER_TENANT = 10
+DEADLINE_EXCEEDED_REASON = "processing_deadline_exceeded"
 
 
-def enqueue_job(job_type: str, payload: dict[str, Any]) -> int:
+DEFAULT_CANCELLATION_REASON = "Job cancelled"
+
+
+def _cancelled_result(reason: str | None = None) -> dict[str, Any]:
+    """Build the stable cancelled result payload returned to requesters."""
+    text = (
+        reason.strip()
+        if isinstance(reason, str) and reason.strip()
+        else DEFAULT_CANCELLATION_REASON
+    )
+    return {"cancelled": True, "reason": text}
+
+
+class TenantQueueLimitExceededError(Exception):
+    """Raised when a tenant has too many queued video jobs."""
+
+    def __init__(self, tenant_id: str, limit: int, queued_count: int, job_type: str):
+        super().__init__(
+            f"tenant {tenant_id} already has {queued_count} queued video job(s) "
+            f"(limit {limit}); cannot enqueue {job_type}"
+        )
+        self.tenant_id = tenant_id
+        self.limit = limit
+        self.queued_count = queued_count
+        self.job_type = job_type
+
+
+def _resolve_tenant_id(tenant_id: str | None, payload: dict[str, Any] | None) -> str:
+    """Resolve the tenant for a job from an explicit value or the payload."""
+    if isinstance(tenant_id, str) and tenant_id.strip():
+        return tenant_id.strip()
+    if isinstance(payload, dict):
+        value = payload.get("tenant_id")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return DEFAULT_TENANT_ID
+
+
+def max_queued_video_jobs_per_tenant() -> int:
+    """Per-tenant queue bound for expensive video jobs."""
+    raw = os.getenv("WORKER_MAX_QUEUED_VIDEO_JOBS_PER_TENANT")
+    if raw is None or not raw.strip():
+        return DEFAULT_MAX_QUEUED_VIDEO_JOBS_PER_TENANT
+    try:
+        value = int(raw)
+    except ValueError:
+        return DEFAULT_MAX_QUEUED_VIDEO_JOBS_PER_TENANT
+    return value if value > 0 else DEFAULT_MAX_QUEUED_VIDEO_JOBS_PER_TENANT
+
+
+def max_concurrent_video_jobs_per_tenant() -> int:
+    """Per-tenant concurrency bound for expensive video jobs."""
+    raw = os.getenv("WORKER_MAX_CONCURRENT_VIDEO_JOBS_PER_TENANT")
+    if raw is None or not raw.strip():
+        return DEFAULT_MAX_CONCURRENT_VIDEO_JOBS_PER_TENANT
+    try:
+        value = int(raw)
+    except ValueError:
+        return DEFAULT_MAX_CONCURRENT_VIDEO_JOBS_PER_TENANT
+    return value if value > 0 else DEFAULT_MAX_CONCURRENT_VIDEO_JOBS_PER_TENANT
+
+
+def count_tenant_video_jobs(tenant_id: str, status: str | None = None) -> int:
+    """Count a tenant's video jobs, optionally filtered by status."""
+    with _JOBS_LOCK:
+        return sum(
+            1
+            for job in _JOBS.values()
+            if job.get("tenant_id", DEFAULT_TENANT_ID) == tenant_id
+            and job.get("type") in EXPENSIVE_VIDEO_JOB_TYPES
+            and (status is None or job.get("status") == status)
+        )
+
+
+def get_tenant_video_job_counts() -> dict[str, dict[str, int]]:
+    """Return per-tenant pending/running counts for expensive video jobs."""
+    counts: dict[str, dict[str, int]] = {}
+    with _JOBS_LOCK:
+        for job in _JOBS.values():
+            if job.get("type") not in EXPENSIVE_VIDEO_JOB_TYPES:
+                continue
+            tenant = job.get("tenant_id", DEFAULT_TENANT_ID)
+            bucket = counts.setdefault(tenant, {"pending": 0, "running": 0})
+            status = job.get("status")
+            if status == "pending":
+                bucket["pending"] += 1
+            elif status == "running":
+                bucket["running"] += 1
+    return counts
+
+
+def enqueue_job(
+    job_type: str,
+    payload: dict[str, Any],
+    *,
+    tenant_id: str | None = None,
+    deadline_at: datetime | None = None,
+    deadline_seconds: float | None = None,
+    now: datetime | None = None,
+    max_queued_per_tenant: int | None = None,
+) -> int:
     """Enqueue a background job and return its job id."""
     global _next_job_id
+    resolved_tenant = _resolve_tenant_id(tenant_id, payload)
+
+    if deadline_at is not None and deadline_seconds is not None:
+        raise ValueError("specify at most one of deadline_at or deadline_seconds")
+
+    current = now if now is not None else datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+
+    resolved_deadline: datetime | None = None
+    if deadline_seconds is not None:
+        if float(deadline_seconds) <= 0:
+            raise ValueError("deadline_seconds must be positive")
+        resolved_deadline = current + timedelta(seconds=float(deadline_seconds))
+    elif deadline_at is not None:
+        resolved_deadline = (
+            deadline_at if deadline_at.tzinfo is not None else deadline_at.replace(tzinfo=timezone.utc)
+        )
+
+    if job_type in EXPENSIVE_VIDEO_JOB_TYPES:
+        limit = (
+            max_queued_per_tenant
+            if max_queued_per_tenant is not None
+            else max_queued_video_jobs_per_tenant()
+        )
+        if limit <= 0:
+            raise ValueError("max_queued_per_tenant must be positive")
+        queued_count = count_tenant_video_jobs(resolved_tenant, status="pending")
+        if queued_count >= limit:
+            raise TenantQueueLimitExceededError(
+                tenant_id=resolved_tenant,
+                limit=limit,
+                queued_count=queued_count,
+                job_type=job_type,
+            )
+
     job_id = _next_job_id
     _next_job_id += 1
-    _JOBS[job_id] = {
+    record: dict[str, Any] = {
         "id": job_id,
         "type": job_type,
+        "tenant_id": resolved_tenant,
         "payload": payload,
+        "_trace_context": job_trace_context(),
         "status": "pending",
         "result": None,
-        "created_at": datetime.now(timezone.utc).isoformat(),
+        "progress": None,
+        "created_at": current.isoformat(),
+        # Queue expiry is measured from when the job (re)entered the queue.
+        "_queued_at": time.time(),
     }
+    if resolved_deadline is not None:
+        record["deadline_at"] = resolved_deadline.isoformat()
+    _JOBS[job_id] = record
     return job_id
 
 
@@ -973,10 +1393,1045 @@ def get_job(job_id: int) -> dict[str, Any] | None:
     return _JOBS.get(job_id)
 
 
-def cancel_job(job_id: int) -> bool:
-    """Cancel a pending job. Returns True on success."""
+def cancel_job(job_id: int, *, reason: str | None = None) -> bool:
+    """Cancel a pending or running job without affecting failure retry counts.
+
+    Preserves a stable cancelled result for the requester and records
+    ``cancelled_at``. Returns True when the job transitioned to ``cancelled``,
+    False when the job does not exist or is already in a terminal state.
+    """
     job = _JOBS.get(job_id)
-    if job and job["status"] == "pending":
+    if job and job.get("status") in ("pending", "running"):
         job["status"] = "cancelled"
+        job["cancelled_at"] = datetime.now(timezone.utc).isoformat()
+        job["result"] = _cancelled_result(reason)
+        job.pop("worker_id", None)
         return True
     return False
+
+
+def mark_job_cancelled(job_id: int, reason: str | None = None) -> bool:
+    """Record intentional worker cancellation for a job.
+
+    Unlike :func:`fail_job`, cancellation never increments ``retry_count``,
+    never re-queues the job for automatic retry, and never sets failure fields
+    (``error`` / ``failed_at``). If the job is already ``cancelled``, its
+    existing ``cancelled_at`` and ``result`` are preserved unchanged.
+    """
+    job = _JOBS.get(job_id)
+    if not job:
+        return False
+    status = job.get("status")
+    if status == "cancelled":
+        if not isinstance(job.get("result"), dict) or job["result"].get("cancelled") is not True:
+            job["result"] = _cancelled_result(reason)
+        job.setdefault("cancelled_at", datetime.now(timezone.utc).isoformat())
+        job.pop("worker_id", None)
+        return True
+    if status in ("pending", "running"):
+        return cancel_job(job_id, reason=reason)
+    return False
+
+
+def is_job_cancelled(job_id: int) -> bool:
+    """Return True when the job exists and is in the ``cancelled`` state."""
+    job = _JOBS.get(job_id)
+    return bool(job and job.get("status") == "cancelled")
+
+
+def _claim_is_current(job: dict[str, Any], generation: int | None, action: str) -> bool:
+    """Return whether a write from the claim ``generation`` may touch ``job``.
+
+    Every lease and every release bumps the job's ``_claim_generation``, so a
+    worker that lost its claim (for example after the shutdown grace period
+    expired and the job was released or re-leased) holds a stale generation.
+    ``None`` keeps the pre-fencing behaviour for callers that do not pass one.
+    """
+    if generation is None or generation == job.get("_claim_generation", 0):
+        return True
+    logger.warning(
+        "job_claim_stale job_id=%s action=%s claim_generation=%s current_generation=%s",
+        job.get("id"),
+        action,
+        generation,
+        job.get("_claim_generation", 0),
+    )
+    return False
+
+
+def lease_job(
+    worker_id: str,
+    job_types: list[str],
+    lease_duration: int = 300,
+    *,
+    now: datetime | None = None,
+    max_concurrent_per_tenant: int | None = None,
+) -> dict[str, Any] | None:
+    """Lease the next eligible pending in-memory job matching ``job_types``.
+
+    Expensive video jobs (``embed``, ``extract``) are fairly scheduled across
+    tenants (fewest running video jobs first, then least-recently-leased
+    tenant, then FIFO within a tenant) and bounded by
+    ``max_concurrent_per_tenant`` (or
+    ``WORKER_MAX_CONCURRENT_VIDEO_JOBS_PER_TENANT``). Jobs whose independent
+    ``deadline_at`` has already elapsed are failed without consuming a tenant
+    concurrency slot or blocking other tenants.
+
+    The returned job carries ``_claim_generation`` (internal; stripped from
+    the public job view): pass it back to :func:`complete_job`,
+    :func:`fail_job`, :func:`report_job_progress` and :func:`heartbeat_job`
+    so writes from a superseded claim are ignored.
+    """
+    global _lease_seq
+    lease_seconds = float(lease_duration)
+    if lease_seconds <= 0:
+        raise ValueError("lease_duration must be positive")
+    concurrent_limit = (
+        max_concurrent_per_tenant
+        if max_concurrent_per_tenant is not None
+        else max_concurrent_video_jobs_per_tenant()
+    )
+    if concurrent_limit <= 0:
+        raise ValueError("max_concurrent_per_tenant must be positive")
+
+    current = now if now is not None else datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    current_iso = current.isoformat()
+
+    with _JOBS_LOCK:
+        running_video_by_tenant: dict[str, int] = {}
+        for job in _JOBS.values():
+            if job.get("status") == "running" and job.get("type") in EXPENSIVE_VIDEO_JOB_TYPES:
+                tenant = job.get("tenant_id", DEFAULT_TENANT_ID)
+                running_video_by_tenant[tenant] = running_video_by_tenant.get(tenant, 0) + 1
+
+        eligible_video: list[dict[str, Any]] = []
+        eligible_other: list[dict[str, Any]] = []
+        for job in _JOBS.values():
+            if job.get("status") != "pending" or job.get("type") not in job_types:
+                continue
+            deadline = _parse_iso_utc(job.get("deadline_at"))
+            if deadline is not None and current >= deadline:
+                job["status"] = "failed"
+                job["error"] = "processing deadline exceeded"
+                job["failed_at"] = current_iso
+                job["processing_state"] = {
+                    "reason": DEADLINE_EXCEEDED_REASON,
+                    "retryable": False,
+                    "category": PROCESSING_STATE_CATEGORY,
+                    "cryptographic_failure": False,
+                    "detected_at": current_iso,
+                }
+                continue
+            if job.get("type") in EXPENSIVE_VIDEO_JOB_TYPES:
+                tenant = job.get("tenant_id", DEFAULT_TENANT_ID)
+                if running_video_by_tenant.get(tenant, 0) >= concurrent_limit:
+                    continue
+                eligible_video.append(job)
+            else:
+                eligible_other.append(job)
+
+        chosen: dict[str, Any] | None = None
+        best_video: dict[str, Any] | None = None
+        if eligible_video:
+            best_video = min(
+                eligible_video,
+                key=lambda j: (
+                    running_video_by_tenant.get(j.get("tenant_id", DEFAULT_TENANT_ID), 0),
+                    _TENANT_LAST_LEASED_SEQ.get(j.get("tenant_id", DEFAULT_TENANT_ID), -1),
+                    j["id"],
+                ),
+            )
+        best_other = min(eligible_other, key=lambda j: j["id"]) if eligible_other else None
+
+        if best_video is not None and best_other is not None:
+            chosen = best_other if best_other["id"] < best_video["id"] else best_video
+        else:
+            chosen = best_video if best_video is not None else best_other
+
+        if chosen is None:
+            return None
+
+        chosen["status"] = "running"
+        chosen["worker_id"] = worker_id
+        chosen["leased_at"] = current_iso
+        chosen["heartbeat_at"] = current_iso
+        chosen["lease_duration_seconds"] = lease_seconds
+        # Every lease invalidates results from an earlier claim on this job.
+        chosen["_claim_generation"] = chosen.get("_claim_generation", 0) + 1
+        chosen.pop("processing_state", None)
+        # Execution timeout is measured from the lease.
+        chosen["_started_at"] = time.time()
+        if chosen.get("type") in EXPENSIVE_VIDEO_JOB_TYPES:
+            _lease_seq += 1
+            _TENANT_LAST_LEASED_SEQ[chosen.get("tenant_id", DEFAULT_TENANT_ID)] = _lease_seq
+        return dict(chosen)
+
+
+def _close_by_deadline(job: dict[str, Any], reason: str, message: str) -> None:
+    job["status"] = "failed"
+    job["failure_reason"] = reason
+    job["error"] = message
+    job["failed_at"] = datetime.now(UTC).isoformat()
+    job.pop("worker_id", None)
+    logger.warning("job_deadline_exceeded job_id=%s reason=%s", job.get("id"), reason)
+
+
+def expire_queued_jobs(queue_ttl_seconds: float, *, now: float | None = None) -> int:
+    """Fail ``pending`` jobs that waited in the queue for ``queue_ttl_seconds``.
+
+    Queue expiry is measured from when the job last entered the queue (enqueue
+    or a retryable release), never from its execution. Expired jobs end as
+    ``failed`` with ``failure_reason`` ``"queue_expired"``. A limit of 0 or
+    less disables expiry. Returns the number of jobs expired.
+    """
+    if not queue_ttl_seconds or queue_ttl_seconds <= 0:
+        return 0
+    current = time.time() if now is None else now
+    expired = 0
+    with _JOBS_LOCK:
+        for job in _JOBS.values():
+            if job.get("status") != "pending":
+                continue
+            queued_at = job.get("_queued_at")
+            if queued_at is None or current - queued_at < queue_ttl_seconds:
+                continue
+            _close_by_deadline(job, JOB_QUEUE_EXPIRED, "Queue expiry exceeded")
+            expired += 1
+    return expired
+
+
+def time_out_job(job_id: int, execution_timeout_seconds: float, *, now: float | None = None) -> bool:
+    """Fail a ``running`` job whose execution exceeded ``execution_timeout_seconds``.
+
+    Execution time is measured from the lease, independently of how long the
+    job waited in the queue. The job ends as ``failed`` with ``failure_reason``
+    ``"execution_timeout"`` and is not retried. Because the process that holds
+    it may still be writing, the job is marked as having an active writer
+    until :func:`release_job_writer` is called; artifact cleanup waits for
+    that. Returns True when the job was timed out.
+    """
+    if not execution_timeout_seconds or execution_timeout_seconds <= 0:
+        return False
+    current = time.time() if now is None else now
+    with _JOBS_LOCK:
+        job = _JOBS.get(job_id)
+        if not job or job.get("status") != "running":
+            return False
+        started_at = job.get("_started_at")
+        if started_at is None or current - started_at < execution_timeout_seconds:
+            return False
+        _close_by_deadline(job, JOB_EXECUTION_TIMEOUT, "Execution timeout exceeded")
+        job["_writer_active"] = True
+        return True
+
+
+def job_writer_active(job_id: int | str) -> bool:
+    """Return whether a process may still be writing this job's artifacts."""
+    job = _JOBS.get(job_id)
+    return bool(job and job.get("_writer_active"))
+
+
+def release_job_writer(job_id: int) -> bool:
+    """Record that the process working on ``job_id`` stopped writing.
+
+    Returns True when the job had been closed by a deadline while its process
+    was still active, i.e. its partial artifacts can now be cleaned.
+    """
+    with _JOBS_LOCK:
+        job = _JOBS.get(job_id)
+        return bool(job and job.pop("_writer_active", False))
+
+
+def _closed_by_deadline(job: dict[str, Any], action: str) -> bool:
+    if job.get("failure_reason") not in _DEADLINE_REASONS:
+        return False
+    logger.warning(
+        "job_deadline_final job_id=%s action=%s reason=%s",
+        job.get("id"),
+        action,
+        job.get("failure_reason"),
+    )
+    return True
+
+
+def heartbeat_job(
+    job_id: int,
+    progress: float | None = None,
+    lease_duration: int = 300,
+    *,
+    now: datetime | None = None,
+    generation: int | None = None,
+) -> None:
+    """Record a heartbeat against an in-memory job lease.
+
+    The heartbeat only extends the lease. Progress is reported separately via
+    :func:`report_job_progress`; ``progress`` is accepted for backwards
+    compatibility and ignored so a heartbeat never overwrites real progress.
+    A heartbeat from a stale claim ``generation`` is ignored.
+    """
+    del progress
+    lease_seconds = float(lease_duration)
+    if lease_seconds <= 0:
+        raise ValueError("lease_duration must be positive")
+    with _JOBS_LOCK:
+        job = _JOBS.get(job_id)
+        if job and job.get("status") == "running" and _claim_is_current(job, generation, "heartbeat"):
+            current = now if now is not None else datetime.now(timezone.utc)
+            if current.tzinfo is None:
+                current = current.replace(tzinfo=timezone.utc)
+            job["heartbeat_at"] = current.isoformat()
+            job["lease_duration_seconds"] = lease_seconds
+            job.pop("processing_state", None)
+
+def get_job_heartbeat_state(
+    job: dict[str, Any],
+    *,
+    now: datetime | None = None,
+    stale_after_seconds: float | None = None,
+) -> dict[str, Any]:
+    """Assess whether a running job's worker heartbeat is stale.
+
+    Returns a retryable processing-state descriptor that is strictly
+    independent of cryptographic/proof validity so unverified output is never
+    classified as a cryptographic failure.
+    """
+    raw_threshold = (
+        stale_after_seconds
+        if stale_after_seconds is not None
+        else job.get("lease_duration_seconds", DEFAULT_HEARTBEAT_STALE_SECONDS)
+    )
+    threshold = float(raw_threshold)
+    if threshold <= 0:
+        raise ValueError("stale_after_seconds must be positive")
+
+    if job.get("status") != "running":
+        return {
+            "stale": False,
+            "reason": None,
+            "retryable": False,
+            "category": PROCESSING_STATE_CATEGORY,
+            "cryptographic_failure": False,
+            "heartbeat_age_seconds": None,
+            "stale_after_seconds": threshold,
+        }
+
+    current = now if now is not None else datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+
+    reference = (
+        _parse_iso_utc(job.get("heartbeat_at"))
+        or _parse_iso_utc(job.get("leased_at"))
+        or _parse_iso_utc(job.get("created_at"))
+    )
+    if reference is None:
+        return {
+            "stale": False,
+            "reason": None,
+            "retryable": False,
+            "category": PROCESSING_STATE_CATEGORY,
+            "cryptographic_failure": False,
+            "heartbeat_age_seconds": None,
+            "stale_after_seconds": threshold,
+        }
+
+    age_seconds = max(0.0, (current - reference).total_seconds())
+    is_stale = age_seconds >= threshold
+    return {
+        "stale": is_stale,
+        "reason": STALE_HEARTBEAT_REASON if is_stale else None,
+        "retryable": is_stale,
+        "category": PROCESSING_STATE_CATEGORY,
+        "cryptographic_failure": False,
+        "heartbeat_age_seconds": round(age_seconds, 3),
+        "stale_after_seconds": threshold,
+    }
+
+
+def reclaim_stale_jobs(
+    *,
+    now: datetime | None = None,
+    stale_after_seconds: float | None = None,
+) -> list[dict[str, Any]]:
+    """Re-queue running jobs whose worker heartbeat has gone stale.
+
+    Stale jobs are transitioned back to ``pending`` with a retryable
+    ``processing_state`` reason (``stale_worker_heartbeat``) rather than being
+    marked ``failed`` or classified as a cryptographic failure.
+    """
+    current = now if now is not None else datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    current_iso = current.isoformat()
+
+    reclaimed: list[dict[str, Any]] = []
+    for job in _JOBS.values():
+        if job.get("status") != "running":
+            continue
+        state = get_job_heartbeat_state(
+            job,
+            now=current,
+            stale_after_seconds=stale_after_seconds,
+        )
+        if not state["stale"]:
+            continue
+        job["status"] = "pending"
+        job.pop("worker_id", None)
+        # Back in the queue: queue expiry restarts, as for a retryable release.
+        job["_queued_at"] = current.timestamp()
+        job["processing_state"] = {
+            "reason": STALE_HEARTBEAT_REASON,
+            "retryable": True,
+            "category": PROCESSING_STATE_CATEGORY,
+            "cryptographic_failure": False,
+            "detected_at": current_iso,
+            "heartbeat_age_seconds": state["heartbeat_age_seconds"],
+            "stale_after_seconds": state["stale_after_seconds"],
+        }
+        reclaimed.append(
+            {
+                "id": job["id"],
+                "type": job["type"],
+                "status": job["status"],
+                "processing_state": dict(job["processing_state"]),
+            }
+        )
+    return reclaimed
+
+
+# Processors may call report_job_progress as often as they like (for example
+# once per decoded frame); updates are stored at most once per this interval.
+JOB_PROGRESS_MIN_INTERVAL_SECONDS = 1.0
+JOB_PROGRESS_PHASE_MAX_LENGTH = 64
+TERMINAL_JOB_STATUSES = frozenset({"completed", "failed", "cancelled"})
+
+
+def report_job_progress(
+    job_id: int,
+    phase: str,
+    percent: float | None = None,
+    *,
+    stage_revision: int | None = None,
+    now: float | None = None,
+    generation: int | None = None,
+) -> bool:
+    """Record ``{"phase", "percent"}`` progress for a running job.
+
+    ``phase`` is a short machine-readable step name (for example
+    ``"embedding"``); ``percent`` is 0-100 or ``None`` when the step has no
+    measurable fraction. Updates are throttled to at most one per
+    ``JOB_PROGRESS_MIN_INTERVAL_SECONDS`` per job, and only running jobs are
+    updated; an update from a stale claim ``generation`` is ignored. Returns
+    True when the update was stored.
+    """
+    with _JOBS_LOCK:
+        job = _JOBS.get(job_id)
+        if not job or job.get("status") != "running":
+            return False
+        if not _claim_is_current(job, generation, "progress"):
+            return False
+        if not isinstance(phase, str) or not phase.strip():
+            raise ValueError("progress phase must be a non-empty string")
+        phase = phase.strip()[:JOB_PROGRESS_PHASE_MAX_LENGTH]
+        if percent is not None:
+            try:
+                percent = float(percent)
+            except (TypeError, ValueError):
+                raise ValueError("progress percent must be a number or None") from None
+            if percent != percent:  # NaN
+                raise ValueError("progress percent must be a number or None")
+            percent = round(min(100.0, max(0.0, percent)), 1)
+        current = time.monotonic() if now is None else now
+        last = job.get("_progress_at")
+        if last is not None and current - last < JOB_PROGRESS_MIN_INTERVAL_SECONDS:
+            return False
+        job["_progress_at"] = current
+        job["progress"] = {"phase": phase, "percent": percent}
+        return True
+
+
+def complete_job(job_id: int, result: Any = None) -> None:
+    """Mark an in-memory job completed."""
+    with _JOBS_LOCK:
+        job = _JOBS.get(job_id)
+        if not job or _closed_by_deadline(job, "complete"):
+            # A job closed by a processing deadline is final: a late result
+            # from the process that overran it is dropped.
+            return
+        job["status"] = "completed"
+        job["result"] = result
+        job["completed_at"] = datetime.now(timezone.utc).isoformat()
+
+
+def fail_job(job_id: int, error: str, *, is_fatal: bool = False) -> None:
+    """Mark an in-memory job failed (fatal) or pending for retry."""
+    with _JOBS_LOCK:
+        job = _JOBS.get(job_id)
+        if not job or _closed_by_deadline(job, "fail"):
+            return
+        job["error"] = sanitize_job_error(error)
+        job["failed_at"] = datetime.now(timezone.utc).isoformat()
+        if is_fatal:
+            job["status"] = "failed"
+        else:
+            job["status"] = "pending"
+            job.pop("worker_id", None)
+            job["_queued_at"] = time.time()  # back in the queue: queue expiry restarts
+
+
+def get_job_queue_metrics() -> dict[str, Any]:
+    """Return counts per job type and state plus the age of the oldest queued job.
+
+    Cheap aggregate query grouped by type and status, utilizing the jobs index.
+    Skips gracefully (returns empty data) when no database is configured or
+    when the database query fails.
+
+    Returns:
+        dict with:
+            "counts": {(type, state): count, ...}
+            "oldest_queued_seconds": {type: seconds, ...}
+    """
+    if not database_url():
+        return {"counts": {}, "oldest_queued_seconds": {}}
+
+    try:
+        with get_connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT
+                        type,
+                        status AS state,
+                        COUNT(*) AS count,
+                        EXTRACT(EPOCH FROM (NOW() - MIN(created_at))) FILTER (WHERE status = 'pending') AS oldest_queued_seconds
+                    FROM jobs
+                    GROUP BY type, status;
+                    """
+                )
+                rows = cursor.fetchall()
+    except Exception as exc:
+        logger.warning("Failed to query job queue metrics: %s", exc)
+        return {"counts": {}, "oldest_queued_seconds": {}}
+
+    counts: dict[tuple[str, str], int] = {}
+    oldest_queued: dict[str, float] = {}
+
+    for row in rows:
+        if isinstance(row, dict):
+            j_type = str(row.get("type", ""))
+            state = str(row.get("state") or row.get("status", ""))
+            cnt = int(row.get("count", 0))
+            oldest_sec = row.get("oldest_queued_seconds")
+        elif hasattr(row, "__getitem__"):
+            try:
+                j_type = str(row["type"])
+                state = str(row["state"] if "state" in row else row["status"])
+                cnt = int(row["count"])
+                oldest_sec = row.get("oldest_queued_seconds") if hasattr(row, "get") else row["oldest_queued_seconds"]
+            except (KeyError, TypeError):
+                j_type = str(row[0])
+                state = str(row[1])
+                cnt = int(row[2])
+                oldest_sec = row[3] if len(row) > 3 else None
+        else:
+            continue
+
+        if not j_type or not state:
+            continue
+
+        counts[(j_type, state)] = cnt
+        if oldest_sec is not None:
+            oldest_queued[j_type] = max(0.0, float(oldest_sec))
+
+    for j_type, _ in counts:
+        if j_type not in oldest_queued:
+            oldest_queued[j_type] = 0.0
+
+    return {
+        "counts": counts,
+        "oldest_queued_seconds": oldest_queued,
+    }
+
+
+get_job_metrics = get_job_queue_metrics
+
+
+# ---------------------------------------------------------------------------
+# Registration conflict quarantine — in-memory stub (no DATABASE_URL)
+# ---------------------------------------------------------------------------
+
+# Maps idempotency_key → list of conflict records (bounded per key)
+_REGISTRATION_CONFLICTS: dict[str, list[dict[str, Any]]] = {}
+_mock_conflict_id = 200000
+
+
+def insert_registration_conflict(
+    *,
+    idempotency_key: str,
+    conflict_field: str,
+    proof_id: str | None = None,
+    video_hash: str | None = None,
+    source_address: str | None = None,
+    tx_hash: str | None = None,
+    conflict_tier_incoming: str | None = None,
+    per_key_max: int = 10,
+    ttl_days: int = 30,
+) -> bool:
+    """Insert a quarantine record for a registration conflict.
+
+    Enforces a per-idempotency-key cap (``per_key_max``).  When the cap is
+    already reached the record is silently skipped and ``False`` is returned.
+    Returns ``True`` when a new record was stored.
+
+    Privacy: only ``conflict_field`` (name), safe public identifiers
+    (``proof_id``, ``video_hash``, ``source_address``, ``tx_hash``), and
+    the ``conflict_tier_incoming`` enum value are persisted.  Raw hash
+    values for the conflicting field are never stored.
+    """
+    global _mock_conflict_id
+
+    if not database_url():
+        existing = _REGISTRATION_CONFLICTS.get(idempotency_key, [])
+        if len(existing) >= per_key_max:
+            return False
+        _mock_conflict_id += 1
+        now = datetime.now(timezone.utc)
+        record: dict[str, Any] = {
+            "id": _mock_conflict_id,
+            "idempotency_key": idempotency_key,
+            "conflict_field": conflict_field,
+            "proof_id": proof_id,
+            "video_hash": video_hash,
+            "source_address": source_address,
+            "tx_hash": tx_hash,
+            "conflict_tier_incoming": conflict_tier_incoming,
+            "created_at": now,
+            "expires_at": now,  # TTL not enforced in memory
+        }
+        _REGISTRATION_CONFLICTS.setdefault(idempotency_key, []).append(record)
+        return True
+
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            # Enforce per-key cap atomically before inserting.
+            cursor.execute(
+                "SELECT COUNT(*) AS cnt FROM registration_conflicts "
+                "WHERE idempotency_key = %s;",
+                (idempotency_key,),
+            )
+            row = cursor.fetchone()
+            if row and int(row["cnt"]) >= per_key_max:
+                return False
+
+            cursor.execute(
+                """
+                INSERT INTO registration_conflicts (
+                    idempotency_key,
+                    conflict_field,
+                    proof_id,
+                    video_hash,
+                    source_address,
+                    tx_hash,
+                    conflict_tier_incoming,
+                    expires_at
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s,
+                        now() + (%s || ' days')::interval)
+                RETURNING id, created_at, expires_at;
+                """,
+                (
+                    idempotency_key,
+                    conflict_field,
+                    proof_id,
+                    video_hash,
+                    source_address,
+                    tx_hash,
+                    conflict_tier_incoming,
+                    str(int(ttl_days)),
+                ),
+            )
+            inserted = cursor.fetchone()
+        connection.commit()
+    return inserted is not None
+
+
+def get_registration_conflicts(
+    idempotency_key: str,
+) -> list[dict[str, Any]]:
+    """Return all quarantine records for the given idempotency key.
+
+    Results are ordered by ``created_at ASC``.  Expired records are
+    included; callers that need only live records should filter on
+    ``expires_at > now()``.
+    """
+    if not database_url():
+        return [
+            dict(r)
+            for r in _REGISTRATION_CONFLICTS.get(idempotency_key, [])
+        ]
+
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT id, idempotency_key, conflict_field,
+                       proof_id, video_hash, source_address,
+                       tx_hash, conflict_tier_incoming,
+                       created_at, expires_at
+                FROM registration_conflicts
+                WHERE idempotency_key = %s
+                ORDER BY created_at ASC;
+                """,
+                (idempotency_key,),
+            )
+            return [dict(row) for row in cursor.fetchall()]
+
+
+def purge_expired_conflicts(batch_size: int = 500) -> int:
+    """Delete expired quarantine records and return the count removed.
+
+    Safe to call repeatedly (no-op when no rows are expired).  Uses a
+    bounded ``LIMIT`` to avoid long-running deletes on large tables.
+    """
+    if not database_url():
+        # In-memory stubs do not enforce expiry.
+        return 0
+
+    limit = max(1, min(int(batch_size), 10_000))
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                DELETE FROM registration_conflicts
+                WHERE id IN (
+                    SELECT id FROM registration_conflicts
+                    WHERE expires_at < now()
+                    LIMIT %s
+                );
+                """,
+                (limit,),
+            )
+            deleted = cursor.rowcount or 0
+        connection.commit()
+    return deleted
+
+
+_INDEXED_EVENTS: dict[tuple[str, int], dict[str, Any]] = {}
+_INDEXER_STATE: dict[str, dict[str, Any]] = {}
+_mock_indexed_id = 100000
+
+
+def insert_indexed_proof_event(
+    *,
+    event_type: str,
+    tx_hash: str,
+    event_index: int,
+    proof_id: str | None = None,
+    contract_id: str | None = None,
+    tx_status: str | None = "confirmed",
+    video_hash: str | None = None,
+    metadata_hash: str | None = None,
+    metadata: dict[str, Any] | None = None,
+    created_at: datetime | None = None,
+    ledger: int | None = None,
+) -> tuple[dict[str, Any], bool]:
+    """Insert an on-chain indexed proof event idempotently.
+
+    Returns ``(row, created)`` where *created* is ``True`` when a new row was
+    written and ``False`` when an existing row with the same ``(tx_hash, event_index)``
+    was already present.
+
+    ``ledger`` is the Soroban ledger sequence number for this event.  When
+    present it is the primary sort key for canonical chain ordering so that
+    events within the same ledger are further ordered by ``event_index`` and
+    then ``tx_hash`` rather than by database insertion time.
+    """
+    global _mock_indexed_id
+    if not database_url():
+        key = (tx_hash, event_index)
+        if key in _INDEXED_EVENTS:
+            return dict(_INDEXED_EVENTS[key]), False
+        _mock_indexed_id += 1
+        now = created_at or datetime.now(timezone.utc)
+        row = {
+            "id": _mock_indexed_id,
+            "event_type": event_type,
+            "proof_id": proof_id,
+            "video_hash": video_hash,
+            "metadata_hash": metadata_hash,
+            "tx_hash": tx_hash,
+            "tx_status": tx_status,
+            "contract_id": contract_id,
+            "event_index": event_index,
+            "ledger": ledger,
+            "metadata": metadata,
+            "created_at": now,
+        }
+        _INDEXED_EVENTS[key] = row
+        return dict(row), True
+
+    idempotency_key = f"indexer:{tx_hash}:{event_index}"
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                insert into proof_events (
+                    event_type,
+                    proof_id,
+                    video_hash,
+                    metadata_hash,
+                    tx_hash,
+                    tx_status,
+                    contract_id,
+                    event_index,
+                    ledger,
+                    idempotency_key,
+                    metadata,
+                    created_at
+                )
+                values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, coalesce(%s, now()))
+                on conflict (tx_hash, event_index)
+                where tx_hash is not null and event_index is not null
+                do nothing
+                returning
+                    id,
+                    event_type,
+                    file_name,
+                    video_hash,
+                    metadata_hash,
+                    proof_id,
+                    tier,
+                    embedded_hash,
+                    tx_hash,
+                    tx_status,
+                    source_address,
+                    contract_id,
+                    retention_class,
+                    expires_at,
+                    legal_hold,
+                    metadata,
+                    time_attestation,
+                    claimed_capture_time,
+                    event_index,
+                    ledger,
+                    created_at;
+                """,
+                (
+                    event_type,
+                    proof_id,
+                    video_hash,
+                    metadata_hash,
+                    tx_hash,
+                    tx_status,
+                    contract_id,
+                    event_index,
+                    ledger,
+                    idempotency_key,
+                    Jsonb(metadata) if metadata is not None else None,
+                    created_at,
+                ),
+            )
+            row = cursor.fetchone()
+            if row is not None:
+                connection.commit()
+                return dict(row), True
+
+            # Existing event lookup on conflict
+            cursor.execute(
+                """
+                select
+                    id,
+                    event_type,
+                    file_name,
+                    video_hash,
+                    metadata_hash,
+                    proof_id,
+                    tier,
+                    embedded_hash,
+                    tx_hash,
+                    tx_status,
+                    source_address,
+                    contract_id,
+                    retention_class,
+                    expires_at,
+                    legal_hold,
+                    metadata,
+                    time_attestation,
+                    claimed_capture_time,
+                    event_index,
+                    ledger,
+                    created_at
+                from proof_events
+                where tx_hash = %s and event_index = %s
+                limit 1;
+                """,
+                (tx_hash, event_index),
+            )
+            existing = cursor.fetchone()
+        connection.rollback()
+
+    if existing:
+        return dict(existing), False
+    raise RuntimeError(f"Conflict on tx {tx_hash}:{event_index} but row not found")
+
+
+def get_indexed_proof_events(
+    event_keys: list[tuple[str, int]],
+) -> list[dict[str, Any]]:
+    """Read indexed projection rows for the supplied (tx_hash, event_index) keys.
+
+    Results are returned in canonical chain order:
+    ``ledger ASC NULLS LAST, event_index ASC NULLS LAST, tx_hash ASC``.
+    This matches the total order of Soroban ledger paging tokens and avoids
+    ordering by database insertion time (``id``), which is non-deterministic
+    across concurrent or replayed ingestion runs.
+    """
+    if not event_keys:
+        return []
+    if not database_url():
+        rows = [
+            dict(_INDEXED_EVENTS[key])
+            for key in event_keys
+            if key in _INDEXED_EVENTS
+        ]
+        # Apply canonical in-memory sort: ledger, event_index, tx_hash
+        rows.sort(key=lambda r: (
+            r.get("ledger") if r.get("ledger") is not None else float("inf"),
+            r.get("event_index") if r.get("event_index") is not None else float("inf"),
+            r.get("tx_hash") or "",
+        ))
+        return rows
+
+    tx_hashes, event_indexes = zip(*event_keys)
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                select tx_hash, event_index, event_type, proof_id, contract_id,
+                       tx_status, ledger, metadata
+                from proof_events
+                where (tx_hash, event_index) in (
+                    select * from unnest(%s::text[], %s::integer[])
+                )
+                order by ledger asc nulls last,
+                         event_index asc nulls last,
+                         tx_hash asc;
+                """,
+                (list(tx_hashes), list(event_indexes)),
+            )
+            return [dict(row) for row in cursor.fetchall()]
+
+
+def get_indexer_cursor(indexer_id: str = "soroban_events") -> str | None:
+    if not database_url():
+        return _INDEXER_STATE.get(indexer_id, {}).get("cursor")
+
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "select cursor from indexer_state where id = %s;",
+                (indexer_id,),
+            )
+            row = cursor.fetchone()
+            return row["cursor"] if row else None
+
+
+def save_indexer_cursor(
+    indexer_id: str = "soroban_events",
+    cursor: str = "",
+    ledger: int | None = None,
+) -> None:
+    if not database_url():
+        _INDEXER_STATE[indexer_id] = {
+            "cursor": cursor,
+            "ledger": ledger,
+            "updated_at": datetime.now(timezone.utc),
+        }
+        return
+
+    with get_connection() as connection:
+        with connection.cursor() as cursor_db:
+            cursor_db.execute(
+                """
+                insert into indexer_state (id, cursor, ledger, updated_at)
+                values (%s, %s, %s, now())
+                on conflict (id) do update
+                set cursor = excluded.cursor,
+                    ledger = excluded.ledger,
+                    updated_at = excluded.updated_at;
+                """,
+                (indexer_id, cursor, ledger),
+            )
+        connection.commit()
+
+
+def get_indexer_checkpoint_manifest(
+    indexer_id: str = "soroban_events",
+) -> dict[str, Any] | None:
+    """Return the stored checkpoint manifest dict for an indexer, if any."""
+    if not database_url():
+        state = _INDEXER_STATE.get(indexer_id)
+        if not state:
+            return None
+        manifest = state.get("manifest")
+        return dict(manifest) if isinstance(manifest, dict) else None
+
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "select cursor, ledger from indexer_state where id = %s;",
+                (indexer_id,),
+            )
+            row = cursor.fetchone()
+            if not row:
+                return None
+            raw_cursor = row.get("cursor")
+            if isinstance(raw_cursor, str) and raw_cursor.startswith("{"):
+                try:
+                    parsed = json.loads(raw_cursor)
+                    if isinstance(parsed, dict) and "manifest_hash" in parsed:
+                        return parsed
+                except Exception:
+                    return None
+            return None
+
+
+def save_indexer_checkpoint_manifest(
+    manifest: dict[str, Any],
+    indexer_id: str = "soroban_events",
+) -> None:
+    """Persist the verified checkpoint manifest alongside the indexer cursor."""
+    cursor_val = str(manifest.get("cursor") or "")
+    ledger_val = manifest.get("observed_ledger")
+    if not database_url():
+        _INDEXER_STATE[indexer_id] = {
+            "cursor": cursor_val,
+            "ledger": ledger_val,
+            "manifest": dict(manifest),
+            "updated_at": datetime.now(timezone.utc),
+        }
+        return
+
+    save_indexer_cursor(
+        indexer_id=indexer_id,
+        cursor=cursor_val,
+        ledger=ledger_val if isinstance(ledger_val, int) else None,
+    )
+
+
+DEFAULT_HEARTBEAT_STALE_SECONDS = 300.0
+STALE_HEARTBEAT_REASON = "stale_worker_heartbeat"
+
+
+def _parse_iso_utc(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)

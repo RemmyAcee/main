@@ -36,13 +36,40 @@ MAX_RETRIES = 5
 RETRY_BACKOFF_SECONDS = [10, 60, 300, 3600, 86400] # 10s, 1m, 5m, 1h, 1d
 
 
+# Fixed allow-list of event types a subscription may filter on.
+ALLOWED_EVENT_TYPES = frozenset({
+    "registration",
+    "revocation",
+    "transfer",
+    "verification",
+})
+
+
+def validate_event_types(event_types: Optional[List[str]]) -> Optional[List[str]]:
+    """Validate a subscription's event_types filter.
+
+    Returns None when the filter is absent (meaning "all events"). Raises
+    ValueError if any name is not in the allow-list.
+    """
+    if event_types is None:
+        return None
+    if not isinstance(event_types, (list, tuple)):
+        raise ValueError("event_types must be a list of strings or None")
+    normalized = []
+    for name in event_types:
+        if not isinstance(name, str) or name not in ALLOWED_EVENT_TYPES:
+            raise ValueError(f"Unknown webhook event type: {name!r}")
+        normalized.append(name)
+    return normalized
+
+
 def get_active_subscriptions() -> List[dict]:
     if not database_url():
         return []
     with get_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT id, url, secret_key FROM webhook_subscriptions WHERE is_active = true"
+                "SELECT id, url, secret_key, event_types FROM webhook_subscriptions WHERE is_active = true"
             )
             return [dict(row) for row in cur.fetchall()]
 
@@ -57,7 +84,22 @@ def queue_webhook_deliveries(event_id: int) -> None:
 
     with get_connection() as conn:
         with conn.cursor() as cur:
+            cur.execute(
+                "SELECT event_type FROM proof_events WHERE id = %s",
+                (event_id,)
+            )
+            event_row = cur.fetchone()
+            if event_row is None:
+                LOGGER.warning(
+                    "queue_webhook_deliveries: event %d not found", event_id
+                )
+                return
+            event_type = event_row["event_type"]
+
             for sub in subs:
+                sub_types = sub.get("event_types")
+                if sub_types is not None and event_type not in sub_types:
+                    continue
                 cur.execute(
                     """
                     INSERT INTO webhook_deliveries (subscription_id, event_id, status)
@@ -181,6 +223,15 @@ def sign_payload(payload_bytes: bytes, secret: str, timestamp: int) -> str:
     return mac.hexdigest()
 
 
+def _is_header_safe(value: Any) -> bool:
+    """Return True for a non-empty string that is safe to send as a header value."""
+    return (
+        isinstance(value, str)
+        and bool(value)
+        and all(0x20 < ord(ch) < 0x7F for ch in value)
+    )
+
+
 def dispatch_webhook(
     delivery: dict,
     *,
@@ -200,7 +251,12 @@ def dispatch_webhook(
         "Content-Type": "application/json",
         "X-Harpocrates-Signature": f"t={timestamp},v1={signature}",
         "User-Agent": "Harpocrates-Webhook/1.0",
+        "X-Harpocrates-Delivery": str(delivery["delivery_id"]),
+        "X-Harpocrates-Attempt": str(int(delivery.get("retry_count") or 0) + 1),
     }
+    event_type = payload.get("event_type") if isinstance(payload, dict) else None
+    if _is_header_safe(event_type):
+        headers["X-Harpocrates-Event"] = event_type
 
     req = urllib.request.Request(url, data=payload_bytes, headers=headers, method="POST")
 

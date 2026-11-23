@@ -1,19 +1,48 @@
+import logging
 import time
 import os
-import logging
+import re
+from datetime import datetime, timezone
+from logging_utils import log_structured, sanitize_diagnostic_text
 import threading
 import traceback
 from pathlib import Path
 
-from db import lease_job, heartbeat_job, complete_job, fail_job, insert_proof_event, init_db
+from db import (
+    DEADLINE_EXCEEDED_REASON,
+    DEFAULT_HEARTBEAT_STALE_SECONDS,
+    DEFAULT_MAX_CONCURRENT_VIDEO_JOBS_PER_TENANT,
+    STALE_HEARTBEAT_REASON,
+    _parse_iso_utc,
+    lease_job,
+    heartbeat_job,
+    get_job_heartbeat_state,
+    reclaim_stale_jobs,
+    report_job_progress,
+    complete_job,
+    fail_job,
+    expire_queued_jobs,
+    time_out_job,
+    mark_job_cancelled,
+    release_job_writer,
+    insert_proof_event,
+    init_db,
+    database_url,
+    get_connection,
+    update_tx_status,
+)
 from envelope import canonical_metadata_hash
 from stego import embed_metadata, extract_metadata, sha256_file
 from noir import generate_silent_witness
 from app import safe_filename, redact_metadata
+from app import normalize_filename, redact_metadata
 from config import load_config
 
-from storage import get_job_input_path, get_job_output_path
+from storage import get_job_input_path, get_job_output_path, sweep_job_files
 from tx_verification import verify_transaction_status
+from tracing import traced_job
+from registration_reconcile import process_verify_tx_job, reconcile_pending_registrations, default_min_confirmations
+from chain_indexer import run_indexer_loop
 
 LOGGER = logging.getLogger("harpocrates.worker")
 if not LOGGER.handlers:
@@ -24,6 +53,23 @@ LOGGER.setLevel(logging.INFO)
 
 WORKER_ID = f"worker-{os.getpid()}"
 
+def sanitize_exception_text(exc: BaseException) -> str:
+    """Render an exception as a bounded, secret-redacted single line."""
+    message = str(exc)
+    rendered = f"{type(exc).__name__}: {message}" if message else type(exc).__name__
+    return sanitize_diagnostic_text(rendered)
+
+
+def sanitize_traceback(exc: BaseException) -> str:
+    """Render a traceback with secrets redacted and bounded in size."""
+    return sanitize_diagnostic_text("".join(traceback.format_exception(exc)))
+
+
+
+class JobCancelledError(Exception):
+    """Raised when a job is intentionally cancelled during worker execution."""
+
+@traced_job("job.media.embed")
 def process_embed(job: dict) -> dict:
     payload = job["payload"]
     job_id = job["id"]
@@ -36,16 +82,23 @@ def process_embed(job: dict) -> dict:
     if not input_path.exists():
         raise RuntimeError(f"Input video file missing for job {job_id}")
         
+    report_job_progress(job_id, "hashing_source", generation=job.get("_claim_generation"))
     source_hash = sha256_file(input_path)
-    
-    embed_metadata(input_path, output_path, metadata)
-    
+
+    def on_frame(frames_done: int, frames_total: int | None) -> None:
+        percent = (frames_done / frames_total * 100.0) if frames_total else None
+        report_job_progress(job_id, "embedding", percent, generation=job.get("_claim_generation"))
+
+    embed_metadata(input_path, output_path, metadata, progress_callback=on_frame)
+
+    report_job_progress(job_id, "hashing_output", generation=job.get("_claim_generation"))
     embedded_hash = sha256_file(output_path)
     metadata_hash = canonical_metadata_hash(metadata)
-    
+
+    report_job_progress(job_id, "recording", generation=job.get("_claim_generation"))
     db_event = insert_proof_event(
         event_type="embed",
-        file_name=safe_filename(filename),
+        file_name=normalize_filename(filename),
         video_hash=embedded_hash,
         metadata_hash=metadata_hash,
         proof_id=metadata.get("proofId"),
@@ -63,6 +116,7 @@ def process_embed(job: dict) -> dict:
         "db_event": db_event
     }
 
+@traced_job("job.media.extract")
 def process_extract(job: dict) -> dict:
     payload = job["payload"]
     job_id = job["id"]
@@ -79,7 +133,7 @@ def process_extract(job: dict) -> dict:
     
     db_event = insert_proof_event(
         event_type="extract",
-        file_name=safe_filename(filename),
+        file_name=normalize_filename(filename),
         video_hash=video_hash,
         metadata_hash=metadata_hash,
         proof_id=metadata.get("proofId") if metadata else None,
@@ -96,13 +150,15 @@ def process_extract(job: dict) -> dict:
         "db_event": db_event
     }
 
+@traced_job("job.proof.noir")
 def process_silent_witness(job: dict) -> dict:
     payload = job["payload"]
-    
+
     video_hash = payload["video_hash"]
     credential_secret = payload["credential_secret"]
     nullifier_secret = payload["nullifier_secret"]
-    
+
+    report_job_progress(job["id"], "generating_proof", generation=job.get("_claim_generation"))
     proof = generate_silent_witness(
         video_hash,
         credential_secret,
@@ -111,113 +167,329 @@ def process_silent_witness(job: dict) -> dict:
     
     return {"proof": proof}
 
-def heartbeat_loop(job_id: int, stop_event: threading.Event):
+def process_verify_tx(job: dict) -> dict:
+    """Reconcile a single registration tx enqueued at proof registration time."""
+    return process_verify_tx_job(job.get("payload") or {})
+
+def heartbeat_loop(job_id: int, stop_event: threading.Event, generation: int | None = None):
     while not stop_event.is_set():
-        heartbeat_job(job_id, progress=0.5, lease_duration=300)
+        heartbeat_job(job_id, lease_duration=300, generation=generation)
         stop_event.wait(60)
 
 def tx_verification_loop(stop_event: threading.Event):
-    """
-    Polls the database for pending Stellar transactions and verifies them against Horizon.
-    """
-    LOGGER.info("Starting transaction verification loop")
-
-    # Load config once; the dataclass is frozen so these values are stable.
-    _config = load_config()
-
+    LOGGER.info("Starting transaction verification / registration reconcile loop")
     while not stop_event.is_set():
         try:
             if not database_url():
                 stop_event.wait(10)
                 continue
-                
-            with get_connection() as conn:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        """
-                        SELECT id, tx_hash 
-                        FROM proof_events 
-                        WHERE tx_hash IS NOT NULL AND tx_status = 'pending'
-                        LIMIT 50
-                        """
-                    )
-                    rows = [dict(row) for row in cur.fetchall()]
-            
-            for row in rows:
-                if stop_event.is_set():
-                    break
-                    
-                tx_hash = row["tx_hash"]
-                LOGGER.info("Verifying transaction (hash redacted)")
-                status = verify_transaction_status(
-                    tx_hash,
-                    connect_timeout=_config.external_fetch_connect_timeout_seconds,
-                    read_timeout=_config.external_fetch_read_timeout_seconds,
-                    max_response_bytes=_config.external_fetch_max_response_bytes,
+            try:
+                report = reconcile_pending_registrations(
+                    limit=50,
+                    min_confirmations=default_min_confirmations(),
                 )
-                
-                # Update DB if terminal or missing
-                if status in ('confirmed', 'failed', 'missing'):
-                    LOGGER.info("Transaction resolved to %s", status)
-                    update_tx_status(tx_hash, status)
-                else:
-                    # Still pending, we will check again next loop
-                    pass
-
+                summary = report.get("summary") or {}
+                LOGGER.info(
+                    "registration_reconcile_batch scanned=%s updated=%s confirmed=%s failed=%s missing=%s pending=%s error=%s",
+                    summary.get("scanned"),
+                    summary.get("updated"),
+                    summary.get("confirmed"),
+                    summary.get("failed"),
+                    summary.get("missing"),
+                    summary.get("pending"),
+                    summary.get("error"),
+                )
+            except Exception:
+                with get_connection() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """
+                            SELECT id, tx_hash
+                            FROM proof_events
+                            WHERE tx_hash IS NOT NULL AND tx_status = 'pending'
+                            LIMIT 50
+                            """
+                        )
+                        rows = [dict(row) for row in cur.fetchall()]
+                for row in rows:
+                    if stop_event.is_set():
+                        break
+                    tx_hash = row["tx_hash"]
+                    LOGGER.info("Verifying transaction %s", str(tx_hash)[:8])
+                    status = verify_transaction_status(tx_hash)
+                    if status in ("confirmed", "failed", "missing"):
+                        LOGGER.info("Transaction %s resolved to %s", str(tx_hash)[:8], status)
+                        update_tx_status(tx_hash, status)
         except Exception as e:
             LOGGER.error("Error in tx verification loop: %s", type(e).__name__)
-        
         stop_event.wait(15)
 
 
-def run_worker():
+import signal
+import sys
+
+DEFAULT_WORKER_GRACE_PERIOD_SECONDS = 30.0
+
+
+def _worker_grace_period_seconds() -> float:
+    raw = os.getenv("WORKER_GRACE_PERIOD_SECONDS")
+    if raw is None or not raw.strip():
+        return DEFAULT_WORKER_GRACE_PERIOD_SECONDS
+    try:
+        val = float(raw)
+        return val if val > 0 else DEFAULT_WORKER_GRACE_PERIOD_SECONDS
+    except ValueError:
+        return DEFAULT_WORKER_GRACE_PERIOD_SECONDS
+
+
+def _worker_heartbeat_stale_seconds() -> float:
+    raw = os.getenv("WORKER_HEARTBEAT_STALE_SECONDS")
+    if raw is None or not raw.strip():
+        return DEFAULT_HEARTBEAT_STALE_SECONDS
+    try:
+        val = float(raw)
+        return val if val > 0 else DEFAULT_HEARTBEAT_STALE_SECONDS
+    except ValueError:
+        return DEFAULT_HEARTBEAT_STALE_SECONDS
+
+
+def _worker_max_concurrent_video_jobs_per_tenant() -> int:
+    raw = os.getenv("WORKER_MAX_CONCURRENT_VIDEO_JOBS_PER_TENANT")
+    if raw is None or not raw.strip():
+        return DEFAULT_MAX_CONCURRENT_VIDEO_JOBS_PER_TENANT
+    try:
+        val = int(raw)
+        return val if val > 0 else DEFAULT_MAX_CONCURRENT_VIDEO_JOBS_PER_TENANT
+    except ValueError:
+        return DEFAULT_MAX_CONCURRENT_VIDEO_JOBS_PER_TENANT
+
+
+def _remove_partial_output(job_id: int) -> None:
+    """Drop the output a timed-out job left behind, once its writer stopped."""
+    try:
+        get_job_output_path(job_id).unlink(missing_ok=True)
+    except OSError as e:
+        LOGGER.error("Partial output cleanup failed for job %s: %s", job_id, type(e).__name__)
+
+
+def run_worker(
+    stop_event: threading.Event | None = None,
+    grace_period_seconds: float | None = None,
+    heartbeat_stale_seconds: float | None = None,
+    max_concurrent_video_jobs_per_tenant: int | None = None,
+    queue_ttl_seconds: float | None = None,
+    execution_timeout_seconds: float | None = None,
+):
     init_db()
+    config = load_config()
+    LOGGER.info("Worker started with config summary")
+    log_structured(LOGGER, logging.INFO, {"event": "worker_start", "config": config.redacted_summary()})
     LOGGER.info(f"Starting worker {WORKER_ID}")
-    
-    stop_verification_event = threading.Event()
-    verification_thread = threading.Thread(target=tx_verification_loop, args=(stop_verification_event,))
+
+    if stop_event is None:
+        stop_event = threading.Event()
+
+    if grace_period_seconds is None:
+        grace_period_seconds = _worker_grace_period_seconds()
+    # Two separate deadlines (0 disables each): queue expiry for pending jobs,
+    # execution timeout for the job this worker is running.
+    if queue_ttl_seconds is None:
+        queue_ttl_seconds = config.job_queue_ttl_seconds
+    if execution_timeout_seconds is None:
+        execution_timeout_seconds = config.job_execution_timeout_seconds
+
+    if heartbeat_stale_seconds is None:
+        heartbeat_stale_seconds = _worker_heartbeat_stale_seconds()
+
+    if max_concurrent_video_jobs_per_tenant is None:
+        max_concurrent_video_jobs_per_tenant = _worker_max_concurrent_video_jobs_per_tenant()
+
+    def _signal_handler(signum, frame):
+        LOGGER.info(f"Received signal {signum}, initiating graceful shutdown")
+        stop_event.set()
+
+    try:
+        signal.signal(signal.SIGTERM, _signal_handler)
+    except (ValueError, AttributeError):
+        pass
+
+    try:
+        signal.signal(signal.SIGINT, _signal_handler)
+    except (ValueError, AttributeError):
+        pass
+
+    verification_thread = threading.Thread(target=tx_verification_loop, args=(stop_event,))
     verification_thread.daemon = True
     verification_thread.start()
-    
-    while True:
+
+    indexer_thread = threading.Thread(target=run_indexer_loop, args=(stop_event,))
+    indexer_thread.daemon = True
+    indexer_thread.start()
+
+    last_sweep_time = time.time()
+    while not stop_event.is_set():
         try:
-            job = lease_job(WORKER_ID, ["embed", "extract", "silent_witness"], lease_duration=300)
+            now_time = time.time()
+            if now_time - last_sweep_time >= 300:
+                last_sweep_time = now_time
+                try:
+                    sweep_job_files()
+                except Exception as e:
+                    LOGGER.error("Job file sweep failed: %s", type(e).__name__)
+
+            try:
+                reclaimed = reclaim_stale_jobs(stale_after_seconds=heartbeat_stale_seconds)
+                for item in reclaimed:
+                    log_structured(
+                        LOGGER,
+                        logging.WARNING,
+                        {
+                            "event": "stale_worker_heartbeat",
+                            "job_id": item["id"],
+                            "job_type": item["type"],
+                            "reason": STALE_HEARTBEAT_REASON,
+                            "retryable": True,
+                            "cryptographic_failure": False,
+                        },
+                    )
+            except Exception as e:
+                LOGGER.error("Stale heartbeat check failed: %s", type(e).__name__)
+            if queue_ttl_seconds:
+                expire_queued_jobs(queue_ttl_seconds)
+
+            job = lease_job(
+                WORKER_ID,
+                ["embed", "extract", "silent_witness", "verify_tx"],
+                lease_duration=300,
+                max_concurrent_per_tenant=max_concurrent_video_jobs_per_tenant,
+            )
             if not job:
-                time.sleep(2)
+                stop_event.wait(2)
                 continue
-                
+
             job_id = job["id"]
             job_type = job["type"]
+            job_deadline = _parse_iso_utc(job.get("deadline_at"))
+            # Writes from this claim carry its generation, so they are ignored
+            # once the job has been released or re-leased (see db._claim_is_current).
+            generation = job.get("_claim_generation")
+            claim = {"generation": generation} if generation is not None else {}
             LOGGER.info(f"Leased job {job_id} of type {job_type}")
-            
-            stop_event = threading.Event()
-            hb_thread = threading.Thread(target=heartbeat_loop, args=(job_id, stop_event))
+
+            hb_stop_event = threading.Event()
+            hb_thread = threading.Thread(target=heartbeat_loop, args=(job_id, hb_stop_event, generation))
             hb_thread.start()
-            
-            try:
-                if job_type == "embed":
-                    result = process_embed(job)
-                elif job_type == "extract":
-                    result = process_extract(job)
-                elif job_type == "silent_witness":
-                    result = process_silent_witness(job)
-                else:
-                    raise ValueError(f"Unknown job type {job_type}")
-                
-                complete_job(job_id, result)
-                LOGGER.info(f"Completed job {job_id}")
-            except Exception as e:
-                LOGGER.error(f"Failed job {job_id}: {e}")
-                LOGGER.error(traceback.format_exc())
-                is_fatal = isinstance(e, ValueError)
-                fail_job(job_id, str(e), is_fatal=is_fatal)
-            finally:
-                stop_event.set()
-                hb_thread.join()
-                
+
+            deadline_exceeded = threading.Event()
+
+            # Bind this job's values: after an execution timeout the loop leases
+            # the next job while this thread may still be running, and the loop
+            # variables are rebound to that next job.
+            def _execute_job(
+                job=job,
+                job_id=job_id,
+                job_type=job_type,
+                hb_stop_event=hb_stop_event,
+                hb_thread=hb_thread,
+                deadline_exceeded=deadline_exceeded,
+            ):
+                try:
+                    if job_type == "embed":
+                        res = process_embed(job)
+                    elif job_type == "extract":
+                        res = process_extract(job)
+                    elif job_type == "silent_witness":
+                        res = process_silent_witness(job)
+                    elif job_type == "verify_tx":
+                        res = process_verify_tx(job)
+                    else:
+                        raise ValueError(f"Unknown job type {job_type}")
+                    if not deadline_exceeded.is_set():
+                        complete_job(job_id, res, **claim)
+                        LOGGER.info(f"Completed job {job_id}")
+                except JobCancelledError as err:
+                    LOGGER.info(f"Cancelled job {job_id}: {err}")
+                    mark_job_cancelled(job_id, reason=str(err) or None)
+                except Exception as err:
+                    if not deadline_exceeded.is_set():
+                        safe_message = sanitize_exception_text(err)
+                        LOGGER.error(f"Failed job {job_id}: {safe_message}")
+                        LOGGER.error(sanitize_traceback(err))
+                        is_fatal = isinstance(err, ValueError) and job_type != "verify_tx"
+                        if job_type == "verify_tx":
+                            is_fatal = isinstance(err, ValueError)
+                        fail_job(job_id, safe_message, is_fatal=is_fatal, **claim)
+                finally:
+                    hb_stop_event.set()
+                    hb_thread.join()
+                    # The process stopped writing: only now may a timed-out
+                    # job's partial output be cleaned.
+                    if release_job_writer(job_id):
+                        _remove_partial_output(job_id)
+
+            work_thread = threading.Thread(target=_execute_job)
+            work_thread.daemon = True
+            work_thread.start()
+
+            while work_thread.is_alive():
+                work_thread.join(timeout=0.1)
+                if (
+                    job_deadline is not None
+                    and work_thread.is_alive()
+                    and datetime.now(timezone.utc) >= job_deadline
+                ):
+                    deadline_exceeded.set()
+                    hb_stop_event.set()
+                    log_structured(
+                        LOGGER,
+                        logging.WARNING,
+                        {
+                            "event": "job_processing_deadline_exceeded",
+                            "job_id": job_id,
+                            "job_type": job_type,
+                            "reason": DEADLINE_EXCEEDED_REASON,
+                            "retryable": False,
+                            "cryptographic_failure": False,
+                        },
+                    )
+                    fail_job(job_id, "Processing deadline exceeded", is_fatal=True, **claim)
+                    break
+                if (
+                    execution_timeout_seconds
+                    and work_thread.is_alive()
+                    and time_out_job(job_id, execution_timeout_seconds)
+                ):
+                    # Python threads cannot be killed: the job is closed now and
+                    # the thread cleans its partial output when it returns.
+                    LOGGER.warning(
+                        f"Job {job_id} exceeded execution timeout of {execution_timeout_seconds}s; failing job"
+                    )
+                    hb_stop_event.set()
+                    break
+                if stop_event.is_set() and work_thread.is_alive():
+                    work_thread.join(timeout=grace_period_seconds)
+                    if work_thread.is_alive():
+                        LOGGER.warning(
+                            f"Job {job_id} did not finish within grace period of {grace_period_seconds}s; releasing job"
+                        )
+                        hb_stop_event.set()
+                        fail_job(job_id, "Worker shutdown grace period exceeded", is_fatal=False, **claim)
+                    break
+
         except Exception as e:
             LOGGER.error(f"Worker loop error: {e}")
-            time.sleep(5)
+            stop_event.wait(5)
+
+    LOGGER.info("Worker stop event set, waiting for tx verification loop to terminate")
+    verification_thread.join(timeout=5.0)
+    LOGGER.info("Worker stopped cleanly")
+
+
+try:
+    from worker_recovery import *  # noqa: F401,F403
+except Exception:
+    pass
 
 if __name__ == "__main__":
     run_worker()
+    sys.exit(0)

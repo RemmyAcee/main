@@ -4,24 +4,103 @@
 extern crate std;
 
 use soroban_sdk::{
-    contract, contracterror, contractevent, contractimpl, contracttype, panic_with_error, Address,
-    Bytes, BytesN, Env, IntoVal, InvokeError, Symbol, Val, Vec as SorobanVec,
+    contract, contracterror, contractevent, contractimpl, contracttype, crypto::Hash,
+    panic_with_error, xdr::ToXdr, Address, Bytes, BytesN, Env, IntoVal, InvokeError, Symbol, Val,
+    Vec,
 };
+
+pub type SorobanVec<T> = Vec<T>;
 
 pub mod verifier_inputs;
 
-use verifier_inputs::{RejectCode, PUBLIC_INPUTS_LEN};
+// Wasm size-budget constants and helpers (#346). Host-side only so the
+// deployed artifact stays byte-identical to the pre-budget build.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod wasm_budget;
+
+use verifier_inputs::{RejectCode, PUBLIC_INPUTS_LEN, REVOCATION_PUBLIC_INPUTS_LEN, SILENT_WITNESS_PUBLIC_INPUTS_LEN, SILENT_WITNESS_V2_PUBLIC_INPUTS_LEN};
 
 /// Schema selectors accepted by [`HarpocratesRegistry::classify_public_inputs`].
 pub const SCHEMA_ID_SILENT_WITNESS: u32 = 1;
 pub const SCHEMA_ID_REVOCATION_WITNESS: u32 = 2;
+/// Circuit-versioned silent-witness envelope (`silent_witness/v2`, #368).
+/// Distinct from [`SCHEMA_ID_SILENT_WITNESS`] so `classify_public_inputs` can
+/// enforce the appended circuit-version field without touching the v1 codec.
+pub const SCHEMA_ID_SILENT_WITNESS_V2: u32 = 3;
+
+/// Bounded compatibility entry for one accepted proof-statement schema.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProofStatementSchemaDescriptor {
+    /// Numeric schema selector accepted by `classify_public_inputs`.
+    pub schema_id: u32,
+    /// Verifier-input codec version (`1` for `hpx-vi/1`, `2` for `hpx-vi/2`).
+    pub verifier_input_version: u32,
+    /// Circuit version associated with this schema.
+    pub circuit_version: u32,
+    /// Exact byte length of canonical public inputs for this schema.
+    pub public_inputs_len: u32,
+    /// Bitmask of critical fields supported by this schema.
+    pub supported_critical_fields: u32,
+}
+
+/// Bounded proof statement compatibility descriptor exposed by the registry.
+///
+/// Describes accepted schema selectors, verifier-input codec versions, active
+/// circuit-version bounds, proof-blob size bounds, and supported critical-field
+/// bitmasks. Unsupported critical fields always fail closed.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProofStatementCompatibilityDescriptor {
+    /// Format version of this compatibility descriptor.
+    pub descriptor_version: u32,
+    /// Lowest accepted verifier-input codec version (`hpx-vi/1` = 1).
+    pub min_verifier_input_version: u32,
+    /// Highest accepted verifier-input codec version (`hpx-vi/2` = 2).
+    pub max_verifier_input_version: u32,
+    /// Lowest circuit version currently accepted by the active verifier window.
+    pub min_circuit_version: u32,
+    /// Highest circuit version currently accepted by the active verifier window.
+    pub max_circuit_version: u32,
+    /// Minimum accepted proof-blob length in bytes.
+    pub min_proof_bytes: u32,
+    /// Maximum accepted proof-blob length in bytes.
+    pub max_proof_bytes: u32,
+    /// Union bitmask of all critical fields supported by this build.
+    pub supported_critical_fields: u32,
+    /// Always `true`: unknown or unsupported critical fields fail closed.
+    pub fail_closed_on_unknown_critical_fields: bool,
+    /// Bounded, deterministic list of accepted proof-statement schemas.
+    pub schemas: SorobanVec<ProofStatementSchemaDescriptor>,
+}
 
 /// Maximum Merkle depth for the `revocation_witness` circuit (#357).
 /// Must match `MAX_REVOCATION_WITNESS_DEPTH` in the Noir circuit and host tooling.
 /// Raising this value requires a new circuit version — do not change it silently.
-pub const MAX_REVOCATION_WITNESS_DEPTH: u32 = 3;
-/// Leaf capacity implied by [`MAX_REVOCATION_WITNESS_DEPTH`] (`2^depth` = 8).
-pub const MAX_REVOCATION_LEAVES: u32 = 8;
+pub const MAX_REVOCATION_WITNESS_DEPTH: u32 = 16;
+/// Leaf capacity implied by [`MAX_REVOCATION_WITNESS_DEPTH`] (`2^depth` = 65536).
+pub const MAX_REVOCATION_LEAVES: u32 = 65536;
+
+/// Maximum number of revocation roots retained in the ring buffer.
+pub const MAX_REVOCATION_ROOT_HISTORY: u32 = 4;
+
+/// Default grace window (in ledgers) during which recent previous revocation
+/// roots remain acceptable in `check_non_revocation` (approx. 10 minutes at 5s/ledger).
+pub const DEFAULT_REVOCATION_ROOT_GRACE_LEDGERS: u32 = 120;
+
+/// Maximum configurable grace window (in ledgers) for previous revocation roots
+/// (approx. 24 hours at 5s/ledger).
+pub const MAX_REVOCATION_ROOT_GRACE_LEDGERS: u32 = 17_280;
+
+/// A revocation root entry stored in the bounded history ring buffer.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RevocationRootEntry {
+    /// Merkle root of the revocation tree.
+    pub root: BytesN<32>,
+    /// Ledger sequence at which this root was activated.
+    pub activation_ledger: u32,
+}
 
 const TIER_SILENT_WITNESS: u32 = 1;
 const TIER_CONSISTENT_SOURCE: u32 = 2;
@@ -39,9 +118,73 @@ const STATUS_POLICY_CANCELLED: u32 = 2;
 const MAX_SIGNERS: u32 = 16;
 const DEFAULT_APPROVAL_TTL_SECS: u64 = 86_400;
 
+pub const MAX_REVOKE_PROOFS_BATCH_SIZE: u32 = 20;
+
+// ---------------------------------------------------------------------------
+// Lineage graph bounds (#333)
+// ---------------------------------------------------------------------------
+//
+// A lineage record is a directed edge from registered evidence (or another
+// derivative) to a new derivative. Both directions of every edge are bounded so
+// no single artefact can be amplified into an unbounded family:
+//
+// - `MAX_LINEAGE_FANOUT` caps the parents one derivative may name (in-degree)
+//   and the derivatives one parent may be charged for (out-degree).
+// - `MAX_LINEAGE_DEPTH` caps how far a derivative may sit from the evidence it
+//   descends from. Depth is derived from the parents, never taken from the
+//   caller, so the bound cannot be bypassed by asserting a smaller number.
+// - `MAX_LINEAGE_PAYLOAD_BYTES` caps the encoded lineage payload a registered
+//   edge stands for. The registry only ever sees 32-byte digests, so the bound
+//   it can check is the parent set; the compile-time assertion below keeps the
+//   two bounds consistent, and the manifest body bound is enforced by the
+//   backend that owns the manifest.
 const MAX_LINEAGE_DEPTH: u32 = 4;
 const MAX_LINEAGE_FANOUT: u32 = 4;
 const MAX_LINEAGE_PAYLOAD_BYTES: u32 = 4096;
+/// Max children returned by a single `list_lineage_children` page (#335).
+pub const MAX_LINEAGE_CHILDREN_PAGE: u32 = 50;
+/// Max indexed children stored per parent proof/digest (#335).
+pub const MAX_LINEAGE_CHILDREN_PER_PARENT: u32 = 256;
+
+// ---------------------------------------------------------------------------
+// Independent timestamp claims (#339)
+// ---------------------------------------------------------------------------
+//
+// On-chain commitments to off-chain time attestations (see
+// `backend/docs/time-attestation-protocol.md`). The ledger timestamp and
+// sequence provide an independent anchor; RFC 3161 material is stored only as
+// a 32-byte commitment (never raw tokens, media, or secrets).
+//
+// Source bitflags (combinable):
+pub const TIMESTAMP_SOURCE_CLAIMED: u32 = 0x01;
+pub const TIMESTAMP_SOURCE_STELLAR: u32 = 0x02;
+pub const TIMESTAMP_SOURCE_RFC3161: u32 = 0x04;
+
+/// Maximum allowed claimed_time drift ahead of ledger time (5 minutes).
+pub const MAX_TIMESTAMP_FUTURE_DRIFT_SECS: u64 = 300;
+
+/// Assurance levels aligned with the off-chain protocol hierarchy.
+pub const TIMESTAMP_ASSURANCE_NONE: u32 = 0;
+pub const TIMESTAMP_ASSURANCE_CLAIMED: u32 = 1;
+pub const TIMESTAMP_ASSURANCE_OBSERVED: u32 = 2;
+pub const TIMESTAMP_ASSURANCE_INDEPENDENT: u32 = 3;
+
+/// A parent set that fits the fan-out cap must also fit the payload budget.
+const _: () = assert!(
+    (MAX_LINEAGE_FANOUT as usize) * 32 <= MAX_LINEAGE_PAYLOAD_BYTES as usize,
+    "MAX_LINEAGE_FANOUT parent digests must fit inside MAX_LINEAGE_PAYLOAD_BYTES"
+);
+
+// ---------------------------------------------------------------------------
+// Tier 2 Source Batch Commitments
+// ---------------------------------------------------------------------------
+pub const MAX_SOURCE_BATCH_COUNT: u32 = 1_048_576;
+pub const MIN_SOURCE_BATCH_COUNT: u32 = 1;
+pub const MAX_SOURCE_BATCH_PROOF_LEN: u32 = 32;
+
+pub const SOURCE_BATCH_LEAF_DOMAIN: u8 = 0x00;
+pub const SOURCE_BATCH_NODE_DOMAIN: u8 = 0x01;
+
 
 // ---------------------------------------------------------------------------
 // On-chain metadata envelope versioning (#317)
@@ -64,7 +207,8 @@ pub const METADATA_ENVELOPE_V2: u32 = 2;
 pub const METADATA_ENVELOPE_VERSION_MAX: u32 = METADATA_ENVELOPE_V2;
 /// Default for bare `metadata_hash` registrations (backward compatible).
 pub const METADATA_ENVELOPE_VERSION_DEFAULT: u32 = METADATA_ENVELOPE_V1;
-
+/// Maximum size of canonical evidence metadata stored on-chain: one 32-byte digest.
+pub const MAX_EVIDENCE_METADATA_HASH_BYTES: u32 = 32;
 
 // ---------------------------------------------------------------------------
 // Proof-history bounds (#90)
@@ -79,6 +223,60 @@ pub const METADATA_ENVELOPE_VERSION_DEFAULT: u32 = METADATA_ENVELOPE_V1;
 //   single query, protecting callers from unbounded iteration costs.
 pub const MAX_HISTORY_ENTRIES_PER_PROOF: u32 = 256;
 pub const MAX_HISTORY_LIMIT: u32 = 50;
+
+// ---------------------------------------------------------------------------
+// Institutional authority history bounds
+// ---------------------------------------------------------------------------
+//
+// The registry records an append-only history of institutional authority
+// transitions (admin proposals/transfers, issuer additions/revocations/rotations,
+// and guardian configuration).
+//
+// - MAX_AUTHORITY_HISTORY_PAGE bounds the maximum number of entries returned
+//   by a single paginated query, protecting callers from unbounded iteration costs.
+// - Sequential per-approver indexing avoids unbounded iteration through historical
+//   approvers, allowing direct O(limit) pagination for specific approvers.
+pub const MAX_AUTHORITY_HISTORY_PAGE: u32 = 50;
+
+pub const ROLE_ADMIN: u32 = 1;
+pub const ROLE_ISSUER: u32 = 2;
+pub const ROLE_GUARDIAN: u32 = 3;
+
+pub const TRANSITION_INITIALIZED: u32 = 1;
+pub const TRANSITION_PROPOSED: u32 = 2;
+pub const TRANSITION_CANCELLED: u32 = 3;
+pub const TRANSITION_ACCEPTED: u32 = 4;
+pub const TRANSITION_ADDED: u32 = 5;
+pub const TRANSITION_REVOKED: u32 = 6;
+pub const TRANSITION_ROTATED: u32 = 7;
+pub const TRANSITION_FINALIZED: u32 = 8;
+pub const TRANSITION_METADATA_UPDATED: u32 = 9;
+pub const TRANSITION_CONFLICT_REVOKED: u32 = 10;
+
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum InstitutionalRole {
+    Admin = 1,
+    Issuer = 2,
+    Guardian = 3,
+}
+
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum RoleTransition {
+    Initialized = 1,
+    Proposed = 2,
+    Cancelled = 3,
+    Accepted = 4,
+    Added = 5,
+    Revoked = 6,
+    Rotated = 7,
+    Finalized = 8,
+    MetadataUpdated = 9,
+    ConflictRevoked = 10,
+}
 
 // ---------------------------------------------------------------------------
 // Scoped emergency pause controls (#87)
@@ -185,6 +383,86 @@ pub const MAX_DELEGATION_DURATION_SECS: u64 = 30 * 24 * 60 * 60;
 pub const MAX_DELEGATIONS_PER_GRANTOR: u32 = 32;
 
 // ---------------------------------------------------------------------------
+// Issuer rotation grace windows (#323)
+// ---------------------------------------------------------------------------
+//
+// A Tier 3 issuer key rotates out by activating a replacement and retiring the
+// old key. Retiring the key must not make evidence it already signed
+// unverifiable in the same transaction: the off-chain key-transparency
+// directory keeps pre-rotation signatures valid inside the predecessor's
+// validity window (`docs/issuer-key-transparency.md`), and the registry has to
+// express the same bounded window or the two public boundaries disagree.
+//
+// A rotation retires the previous key immediately — it can no longer sign new
+// seals — and opens a bounded grace window during which the evidence it already
+// signed stays verifiable. The window is lazy: readers compare
+// `grace_expires_at` against ledger time, so it lapses without a transaction,
+// and any caller may settle the record afterwards with
+// `finalize_issuer_rotation`, which publishes the grace-expiry event.
+//
+// `grace_secs == 0` selects `DEFAULT_ISSUER_ROTATION_GRACE_SECS`, so a rotation
+// can never silently drop the window. A request above
+// `MAX_ISSUER_ROTATION_GRACE_SECS`, or one whose `rotated_at + grace_secs`
+// overflows, fails closed with `InvalidIssuerRotationGrace`.
+//
+// Revocation outranks the window: `revoke_issuer`, its timelocked twin, and
+// `add_issuer` all clear any rotation record, so a withdrawn or re-onboarded
+// key never keeps standing it should not have.
+//
+// Migration. `DataKey::IssuerRotation(issuer)` is a new, additive key and the
+// stored `IssuerRecord` keeps its exact `{metadata_hash, active}` shape, so
+// records written by an earlier wasm still decode unchanged and a deployment
+// that never rotates reads as "no rotation" with standing decided by `active`
+// alone. Rolling back to a pre-#323 wasm ignores the key and falls back to the
+// `active` flag, which only widens acceptance for a retired key — never for a
+// revoked one, and never for new evidence after an explicit `revoke_issuer`.
+
+/// Grace window applied when `rotate_issuer` is called with `grace_secs == 0`
+/// (90 days). A rotation never silently leaves pre-rotation evidence uncovered.
+pub const DEFAULT_ISSUER_ROTATION_GRACE_SECS: u64 = 90 * 24 * 60 * 60;
+/// Longest grace window an admin may open in a single rotation (365 days).
+pub const MAX_ISSUER_ROTATION_GRACE_SECS: u64 = 365 * 24 * 60 * 60;
+
+// ---------------------------------------------------------------------------
+// Verifier circuit-version validation (#343)
+// ---------------------------------------------------------------------------
+//
+// Every proof that crosses the contract's public boundary was produced by a
+// specific Noir circuit version. Two parties own that fact: this wasm build
+// knows which frame versions its codec can frame and interpret, and the
+// configured external verifier is the authority on which circuit versions it
+// can actually check. This section binds those facts so a call cannot smuggle
+// a proof generated by a circuit the active verifier does not support.
+//
+// There is exactly one source of truth for each version value: the codec
+// constants in `verifier_inputs` and the circuit domain separators already in
+// this file. The implicit versions below are read off those existing
+// boundaries; this is not a second protocol truth.
+//
+// Compatibility. The active window defaults to the full built-in range and is
+// only narrowed by an explicit admin call, so existing deployments and stored
+// evidence validate exactly as before. A verifier that declares a window is
+// checked at the trust boundary *before* it is invoked, so an unsupported
+// version fails closed with a stable error instead of reaching a dependency
+// that cannot answer.
+
+/// Circuit version of the v1 silent-witness frame (160 bytes).
+pub const CIRCUIT_VERSION_SILENT_WITNESS_V1: u32 = 1;
+/// Circuit version of the v2 scoped-nullifier frame (224 bytes).
+pub const CIRCUIT_VERSION_SILENT_WITNESS_V2: u32 = 2;
+/// Circuit version of the revocation-witness frame (128 bytes).
+pub const CIRCUIT_VERSION_REVOCATION_WITNESS: u32 = 1;
+/// Circuit version of the aggregation proof (`AGGREGATION_DOMAIN_SEPARATOR`).
+pub const CIRCUIT_VERSION_AGGREGATION: u32 = 1;
+/// Circuit version of the selective-disclosure proof (carried in the frame).
+pub const CIRCUIT_VERSION_SELECTIVE_DISCLOSURE: u32 = CURRENT_SELECTIVE_DISCLOSURE_VERSION;
+
+/// Lowest circuit version this wasm build can frame and interpret.
+pub const MIN_SUPPORTED_CIRCUIT_VERSION: u32 = 1;
+/// Highest circuit version this wasm build can frame and interpret.
+pub const MAX_SUPPORTED_CIRCUIT_VERSION: u32 = CIRCUIT_VERSION_SILENT_WITNESS_V2;
+
+// ---------------------------------------------------------------------------
 // Verifier rotation state
 // ---------------------------------------------------------------------------
 #[contracttype]
@@ -199,6 +477,134 @@ pub struct VerifierState {
     pub rollback_window_end: u64,
 }
 
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RolePolicy {
+    pub timelock_min_delay_secs: u64,
+    pub verifier: Option<Address>,
+    pub guardian: Option<Address>,
+    pub paused_domains: u32,
+    pub schema_version: u32,
+}
+
+/// Aggregate snapshot of the registry's operational configuration (#721).
+///
+/// Combines the individual configuration getters and the currently paused
+/// registration domains bitmask into a single read-only response so clients
+/// can inspect the operational state in one simulation.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RegistryConfig {
+    pub proof_ttl: u64,
+    pub timelock_min_delay_secs: u64,
+    pub verifier: Option<Address>,
+    pub verifier_state: VerifierState,
+    pub guardian: Option<Address>,
+    pub schema_version: u32,
+    pub revocation_root: Option<BytesN<32>>,
+    pub paused_domains: u32,
+}
+
+/// Current registry input and metadata limits.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RegistryLimits {
+    pub silent_witness_v1_inputs_len: u32,
+    pub silent_witness_v2_inputs_len: u32,
+    pub revocation_inputs_len: u32,
+    pub evidence_metadata_hash_bytes: u32,
+    pub schema_version: u32,
+}
+
+/// A verifier's declared circuit-version window (#343).
+///
+/// Immutable record of what the active verifier was told it may check, plus
+/// who declared it and when. When no record exists the window is the full
+/// built-in `[MIN_SUPPORTED_CIRCUIT_VERSION, MAX_SUPPORTED_CIRCUIT_VERSION]`
+/// range, which is the pre-#343 behaviour.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifierCircuitVersions {
+    pub min_version: u32,
+    pub max_version: u32,
+    pub set_by: Address,
+    pub set_at: u64,
+}
+
+/// Configuration snapshot for verifier-backed operations.
+///
+/// Loaded once at the start of verified registration calls to reduce repeated
+/// storage reads across validation helpers.
+#[derive(Clone, Debug)]
+pub struct VerifierContext {
+    pub verifier: Option<Address>,
+    pub circuit_versions: (u32, u32),
+}
+
+impl VerifierContext {
+    pub fn load(env: &Env) -> Self {
+        let verifier = env.storage().persistent().get(&DataKey::Verifier);
+        let circuit_versions = get_verifier_circuit_versions_raw(env);
+        Self {
+            verifier,
+            circuit_versions,
+        }
+    }
+
+    pub fn verifier(&self, env: &Env) -> &Address {
+        self.verifier
+            .as_ref()
+            .unwrap_or_else(|| panic_with_error!(env, RegistryError::VerifierNotSet))
+    }
+
+    pub fn require_supported_circuit_version(&self, env: &Env, circuit_version: u32) {
+        if circuit_version < MIN_SUPPORTED_CIRCUIT_VERSION
+            || circuit_version > MAX_SUPPORTED_CIRCUIT_VERSION
+        {
+            panic_with_error!(env, RegistryError::UnsupportedCircuitVersion);
+        }
+
+        let (min_version, max_version) = self.circuit_versions;
+        if circuit_version < min_version || circuit_version > max_version {
+            panic_with_error!(env, RegistryError::UnsupportedCircuitVersion);
+        }
+    }
+
+    pub fn require_verified_proof(
+        &self,
+        env: &Env,
+        circuit_version: u32,
+        public_inputs: Bytes,
+        proof: Bytes,
+    ) {
+        self.require_supported_circuit_version(env, circuit_version);
+
+        if proof.is_empty() {
+            panic_with_error!(env, RegistryError::InvalidProof);
+        }
+
+        let verifier = self.verifier(env);
+        if !verify_external_proof(env, verifier, public_inputs, proof) {
+            panic_with_error!(env, RegistryError::InvalidProof);
+        }
+    }
+
+    pub fn has_nullifier(&self, env: &Env, nullifier: &BytesN<32>) -> bool {
+        if let Some(ref verifier) = self.verifier {
+            if env
+                .storage()
+                .persistent()
+                .has(&DataKey::VerifierNullifier(verifier.clone(), nullifier.clone()))
+            {
+                return true;
+            }
+        }
+        env.storage()
+            .persistent()
+            .has(&DataKey::Nullifier(nullifier.clone()))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Timelocked verifier and policy administration (#86)
 // ---------------------------------------------------------------------------
@@ -211,9 +617,12 @@ pub enum ProposalAction {
     RevokeIssuer = 2,
     SetProofTtl = 3,
     RevokeCredentialRoot = 4,
+    ExpireCredentialRoot = 5,
+    UpgradeWasm = 6,
 }
 
 pub const DEFAULT_SCOPE_EPOCH: u64 = 0;
+pub const MIN_AGGREGATION_SIZE: u32 = 1;
 pub const MAX_AGGREGATION_SIZE: u32 = 8;
 pub const AGGREGATION_DOMAIN_SEPARATOR: [u8; 32] = [0u8; 32];
 
@@ -233,6 +642,40 @@ pub struct TimelockProposal {
 pub const DEFAULT_TIMELOCK_MIN_DELAY_SECS: u64 = 86_400;
 pub const MAX_TIMELOCK_MIN_DELAY_SECS: u64 = 604_800;
 pub const MAX_PENDING_TIMELOCK_PROPOSALS: u32 = 16;
+/// Maximum number of proposals a single `list_timelock_proposals` page may return.
+pub const MAX_TIMELOCK_PROPOSALS_PAGE: u32 = 25;
+
+/// Paginated result from `list_timelock_proposals`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TimelockProposalPage {
+    pub proposals: Vec<TimelockProposal>,
+    /// Cursor for the next page (`Some(next_cursor)`), or `None` if end reached.
+    pub next_cursor: Option<u32>,
+}
+
+/// Maximum number of credential roots a single `list_credential_roots` page may return (#731).
+pub const MAX_CREDENTIAL_ROOTS_PAGE: u32 = 25;
+/// Maximum number of credential roots backfilled in a single `upgrade_storage` call (#731).
+pub const MAX_ROOTS_BACKFILL_BATCH: u32 = 25;
+
+/// An entry in a `CredentialRootPage` (#731).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CredentialRootEntry {
+    pub root_hash: BytesN<32>,
+    pub status: u32,
+}
+
+/// Paginated result from `list_credential_roots` (#731).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CredentialRootPage {
+    pub roots: Vec<CredentialRootEntry>,
+    /// Cursor for the next page (`Some(next_cursor)`), or `None` if end reached.
+    pub next_cursor: Option<u32>,
+}
+
 
 /// A narrowly scoped, expiring authority to act for `grantor`.
 #[contracttype]
@@ -294,15 +737,100 @@ pub enum ProofVerificationStatus {
     NotFound,
 }
 
+/// Additive status view; a missing effective ledger never implies validity.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProofStatusDetails {
+    pub status: ProofVerificationStatus,
+    /// First revocation ledger sequence, not the current query ledger or a
+    /// timestamp. `None` for other statuses and legacy revocations.
+    pub revoked_effective_ledger: Option<u32>,
+}
+
+/// Comprehensive proof assurance view combining status, tier, timestamp assurance,
+/// dispute count, envelope version, and issuer verifiability in a single call.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProofAssurance {
+    pub status: ProofVerificationStatus,
+    pub tier: u32,
+    pub timestamp_assurance_level: u32,
+    pub open_dispute_count: u32,
+    pub envelope_version: u32,
+    pub issuer_verifiable: bool,
+}
+
+impl ProofAssurance {
+    pub fn timestamp_assurance(&self) -> u32 {
+        self.timestamp_assurance_level
+    }
+
+    pub fn is_issuer_verifiable(&self) -> bool {
+        self.issuer_verifiable
+    }
+}
+
+/// On-chain lineage edge for a verifiable derivative.
+///
+/// `parent_proof_ids` retain graph topology for cycle/depth checks.
+/// `parent_commitments` store domain-separated content bindings for each
+/// parent so public boundaries (events / interop) can cite parents without
+/// relying on raw proof identifiers alone. Derived as
+/// `SHA-256("harp_lin_pc" || binding_a || binding_b)` where a proof parent
+/// binds `(video_hash, metadata_hash)` and a lineage parent binds
+/// `(manifest_digest, output_digest)`.
+///
+/// Migration: additive field on new registrations. Pre-existing lineage
+/// rows (if any) lack commitments and must be re-registered after upgrade;
+/// rolling back to a pre-#332 wasm ignores the new event / getter and leaves
+/// stored records readable only by matching wasm.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LineageRecord {
-    pub parent_proof_ids: SorobanVec<BytesN<32>>,
+    pub parent_proof_ids: soroban_sdk::Vec<BytesN<32>>,
+    pub parent_commitments: soroban_sdk::Vec<BytesN<32>>,
     pub manifest_digest: BytesN<32>,
     pub actor: Address,
     pub operation_type: Symbol,
     pub output_digest: BytesN<32>,
     pub depth: u32,
+}
+
+/// On-chain independent timestamp claim for a registered proof (#339).
+///
+/// Stores commitments and ledger-derived anchors only — never TSA token
+/// bytes, media, witness values, or private keys.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TimestampClaim {
+    /// Proof this claim is bound to.
+    pub proof_id: BytesN<32>,
+    /// Digest of the off-chain `harpocrates-time-attestation/v1` envelope.
+    pub attestation_digest: BytesN<32>,
+    /// Optional claimed capture time (unix seconds). `0` means absent.
+    pub claimed_time: u64,
+    /// Ledger timestamp when this claim was anchored (independent observed time).
+    pub anchored_at: u64,
+    /// Ledger sequence at anchor time for external cross-checks.
+    pub ledger_sequence: u32,
+    /// Combinable `TIMESTAMP_SOURCE_*` bitflags.
+    pub sources: u32,
+    /// Commitment to an RFC 3161 token (`[0;32]` if absent).
+    pub rfc3161_commitment: BytesN<32>,
+    /// Authenticated actor who submitted the claim.
+    pub actor: Address,
+    /// Derived assurance level (`TIMESTAMP_ASSURANCE_*`).
+    pub assurance: u32,
+}
+
+/// One page of child output digests for a lineage parent (#335).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LineageChildrenPage {
+    pub children: soroban_sdk::Vec<BytesN<32>>,
+    /// Absolute offset of the next unread child (equals `total` when exhausted).
+    pub next_offset: u32,
+    pub total: u32,
 }
 
 #[contracttype]
@@ -321,6 +849,59 @@ pub struct ProofRecord {
     /// aggregated batch (0 = not part of a batch).
     pub batch_size: u32,
 }
+
+/// Tier 2 source batch root record.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BatchRecord {
+    pub root: BytesN<32>,
+    pub source: Address,
+    pub count: u32,
+    pub metadata_hash: BytesN<32>,
+    pub created_at: u64,
+}
+
+pub type SourceBatchRecord = BatchRecord;
+
+/// Evaluation stage represented by a [`StatementPreflightResult`].
+///
+/// Preflight evaluates canonical public-field framing and current on-chain
+/// registry policy only; it never runs cryptographic proof verification or
+/// account signature authorization, and never mutates contract storage.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum PreflightStage {
+    /// Public field structure and active registry policy evaluated; cryptographic
+    /// proof or signature verification has NOT executed.
+    StructureAndPolicyOnly = 1,
+}
+
+/// Read-only verdict returned by [`HarpocratesRegistry::preflight_statement`]
+/// and [`HarpocratesRegistry::preflight_tier_statement`] (#1199).
+///
+/// Explicitly separates structural/policy preflight acceptance from
+/// cryptographic proof or signature verification:
+/// - `cryptographically_verified` is always `false`
+/// - `proof_stored` is always `false`
+/// - `requires_crypto_verify` is always `true`
+/// - `stage` is always [`PreflightStage::StructureAndPolicyOnly`]
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StatementPreflightResult {
+    pub preflight_accepted: bool,
+    pub cryptographically_verified: bool,
+    pub proof_stored: bool,
+    pub requires_crypto_verify: bool,
+    pub stage: PreflightStage,
+    pub registry_error_code: u32,
+    pub codec_reject_code: u32,
+    pub tier: u32,
+    pub circuit_version: u32,
+    pub envelope_version: u32,
+}
+
+
 
 /// Versioned on-chain metadata envelope binding (#317).
 ///
@@ -346,12 +927,71 @@ pub struct IssuerRecord {
     pub active: bool,
 }
 
+/// Rotation grace record for an issuer key that has rotated out (#323).
+///
+/// Keyed by the *previous* (retired) key at `DataKey::IssuerRotation(Address)`
+/// so the stored `IssuerRecord` keeps its byte-identical `{metadata_hash,
+/// active}` shape and records written by an earlier wasm still decode.
+/// Presence means "this key was rotated, not revoked, and the evidence it
+/// already signed stays verifiable until `grace_expires_at`".
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IssuerRotationRecord {
+    /// The key that rotated out — also the record's storage key.
+    pub previous_issuer: Address,
+    /// The active key that replaced it.
+    pub replacement_issuer: Address,
+    /// Ledger timestamp at which the rotation was accepted.
+    pub rotated_at: u64,
+    /// Epoch seconds after which the grace window has lapsed. A reader at
+    /// exactly this timestamp sees the window as already closed.
+    pub grace_expires_at: u64,
+    /// Resolved window length (the protocol default when the caller passed 0).
+    pub grace_secs: u64,
+}
+
+/// Admin-set registration quota for one key, measured in ledger-time window
+/// buckets (#806). Absence of a record means unlimited, so deployments that
+/// never call `set_issuer_quota` behave exactly as before.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IssuerQuotaRecord {
+    /// Registrations allowed per key per window bucket. Never zero while the
+    /// record exists; zero clears the quota.
+    pub max_registrations: u32,
+    /// Window-bucket width in seconds. Bucket index is `timestamp /
+    /// window_secs`, so a rollover into the next bucket resets the count.
+    pub window_secs: u64,
+}
+
+/// One small usage record per keyed address: the current ledger-time window
+/// bucket and how many registrations have been charged inside it (#806).
+/// A stored `bucket` behind the current one is treated as empty, so counts
+/// need no explicit reset and the storage stays a single compact record.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IssuerQuotaUsage {
+    /// `ledger timestamp / window_secs` at the time of the last charge.
+    pub bucket: u64,
+    /// Registrations charged inside `bucket`.
+    pub count: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CredentialRootRecordV1 {
+    pub metadata_hash: BytesN<32>,
+    pub active: bool,
+    pub issued_at: u64,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CredentialRootRecord {
     pub metadata_hash: BytesN<32>,
-    pub active: bool,
+    pub status: u32,
     pub issued_at: u64,
+    pub expires_at: u64,
 }
 
 /// Pause record for a single registration domain bit. Presence of a record
@@ -387,6 +1027,36 @@ pub struct ProofHistoryEntry {
     pub reason_code: u32,
 }
 
+/// An entry in the institutional authority transition history.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthorityHistoryEntry {
+    /// Global 1-based sequential reference.
+    pub reference: u32,
+    /// Ledger timestamp when the transition was committed.
+    pub ledger_timestamp: u64,
+    /// The principal holding or transitioning the role.
+    pub approver: Address,
+    /// Institutional role code (`ROLE_*`).
+    pub role: u32,
+    /// Role transition code (`TRANSITION_*`).
+    pub transition: u32,
+    /// Authorizing actor address, if applicable.
+    pub actor: Option<Address>,
+    /// Associated metadata commitment (e.g. issuer metadata hash), if any.
+    pub metadata_hash: Option<BytesN<32>>,
+}
+
+/// Paginated result of institutional authority transition entries.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthorityHistoryPage {
+    pub entries: SorobanVec<AuthorityHistoryEntry>,
+    pub next_offset: u32,
+    pub next_cursor: Option<u32>,
+    pub total: u32,
+}
+
 #[contractevent(topics = ["proof", "reg"])]
 pub struct ProofRegistered {
     #[topic]
@@ -398,8 +1068,12 @@ pub struct ProofRegistered {
 }
 
 // Metadata envelope events (#317) — version + hash only (privacy-safe).
-#[contractevent(topics = ["metadata", "envelope", "bound"])]
+// Third topic carried as a `Symbol` field (spec allows two literal prefixes);
+// emitted topics stay `["metadata", "envelope", "bound", proof_id]`.
+#[contractevent(topics = ["metadata", "envelope"])]
 pub struct MetadataEnvelopeBound {
+    #[topic]
+    pub bound: Symbol,
     #[topic]
     pub proof_id: BytesN<32>,
     pub version: u32,
@@ -407,8 +1081,10 @@ pub struct MetadataEnvelopeBound {
     pub bound_at: u64,
 }
 
-#[contractevent(topics = ["metadata", "envelope", "upgraded"])]
+#[contractevent(topics = ["metadata", "envelope"])]
 pub struct MetadataEnvelopeUpgraded {
+    #[topic]
+    pub upgraded: Symbol,
     #[topic]
     pub proof_id: BytesN<32>,
     pub previous: u32,
@@ -416,8 +1092,15 @@ pub struct MetadataEnvelopeUpgraded {
     pub metadata_hash: BytesN<32>,
 }
 
-#[contractevent(topics = ["proof", "batch", "reg"])]
+// The spec allows at most two literal prefix topics
+// (`ScSpecEventV0.prefix_topics` is `VecM<ScSymbol, 2>`), so the third topic
+// is carried as a `Symbol` field. Fields follow the prefix in declaration
+// order, keeping the emitted topic list exactly
+// `["proof", "batch", "reg", batch_id]`.
+#[contractevent(topics = ["proof", "batch"])]
 pub struct BatchProofRegistered {
+    #[topic]
+    pub reg: Symbol,
     #[topic]
     pub batch_id: BytesN<32>,
     pub credential_root: BytesN<32>,
@@ -425,6 +1108,18 @@ pub struct BatchProofRegistered {
     pub tier: u32,
     pub status: u32,
 }
+
+#[contractevent(topics = ["batch", "root"])]
+pub struct SourceBatchRootRegistered {
+    #[topic]
+    pub root: BytesN<32>,
+    #[topic]
+    pub source: Address,
+    pub count: u32,
+    pub metadata_hash: BytesN<32>,
+    pub registered_at: u64,
+}
+
 
 #[contractevent(topics = ["proof", "revoke"])]
 pub struct ProofRevoked {
@@ -444,6 +1139,50 @@ pub struct IssuerAdded {
 pub struct IssuerRevoked {
     #[topic]
     pub issuer: Address,
+}
+
+#[contractevent(topics = ["issuer", "metadata"])]
+pub struct IssuerMetadataUpdated {
+    #[topic]
+    pub issuer: Address,
+    pub previous_metadata_hash: BytesN<32>,
+    pub new_metadata_hash: BytesN<32>,
+}
+
+/// Emitted when an active issuer key rotates to a replacement (#323).
+///
+/// Carries addresses, ledger time, and the grace bound only — never key
+/// material, metadata preimages, witnesses, media, or secrets.
+#[contractevent(topics = ["issuer", "rotate"])]
+pub struct IssuerRotated {
+    #[topic]
+    pub previous_issuer: Address,
+    pub replacement_issuer: Address,
+    pub rotated_at: u64,
+    pub grace_expires_at: u64,
+    pub grace_secs: u64,
+}
+
+/// Emitted when a rotation grace window is settled after it lapses (#323).
+#[contractevent(topics = ["issuer", "grace"])]
+pub struct IssuerRotationGraceExpired {
+    #[topic]
+    pub issuer: Address,
+    pub replacement_issuer: Address,
+    pub grace_expires_at: u64,
+}
+
+/// Emitted when the admin sets or clears one key's registration quota (#806).
+/// A `max_registrations` (or `window_secs`) of zero publishes the clear, so an
+/// indexer can tell "unlimited" from "no configuration ever" by the event log.
+#[contractevent(topics = ["quota", "set"])]
+pub struct IssuerQuotaSet {
+    #[topic]
+    pub issuer: Address,
+    pub max_registrations: u32,
+    pub window_secs: u64,
+    #[topic]
+    pub set_by: Address,
 }
 
 #[contractevent(topics = ["verif", "set"])]
@@ -477,6 +1216,16 @@ pub struct VerifierRotationRolledBack {
     pub previous_verifier: Address,
 }
 
+/// Emitted when the admin narrows or widens the active verifier's supported
+/// circuit-version window (#343). Version numbers only — no witness material.
+#[contractevent(topics = ["verif", "versions"])]
+pub struct VerifierCircuitVersionsSet {
+    #[topic]
+    pub verifier: Address,
+    pub min_version: u32,
+    pub max_version: u32,
+}
+
 #[contractevent(topics = ["credroot", "add"])]
 pub struct CredentialRootAdded {
     #[topic]
@@ -489,6 +1238,13 @@ pub struct CredentialRootAdded {
 pub struct CredentialRootRevoked {
     #[topic]
     pub credential_root: BytesN<32>,
+}
+
+#[contractevent(topics = ["credroot", "expire"])]
+pub struct CredentialRootExpired {
+    #[topic]
+    pub credential_root: BytesN<32>,
+    pub expired_at: u64,
 }
 
 /// Domain-separated, privacy-safe proof lifecycle history event (#90).
@@ -504,6 +1260,22 @@ pub struct ProofHistoryEvent {
     pub timestamp: u64,
     pub actor: Option<Address>,
     pub reason_code: u32,
+}
+
+/// Privacy-safe lineage registration signal (#332).
+///
+/// Publishes parent *commitments* (not raw parent proof ids) so indexers and
+/// interoperable consumers can observe derivative linkage without expanding
+/// the public surface beyond opaque 32-byte digests.
+#[contractevent(topics = ["lineage", "reg"])]
+pub struct LineageRegistered {
+    #[topic]
+    pub output_digest: BytesN<32>,
+    pub manifest_digest: BytesN<32>,
+    pub actor: Address,
+    pub operation_type: Symbol,
+    pub depth: u32,
+    pub parent_commitments: soroban_sdk::Vec<BytesN<32>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -550,6 +1322,8 @@ pub struct ProofHistoryEvent {
 
 /// Maximum number of simultaneously Open disputes allowed per proof.
 pub const MAX_OPEN_DISPUTES_PER_PROOF: u32 = 4;
+/// Maximum number of simultaneously Open disputes allowed across all proofs per reporter.
+pub const MAX_OPEN_DISPUTES_PER_REPORTER: u32 = 5;
 /// Minimum seconds between consecutive disputes by the same reporter on the
 /// same proof (24 hours).
 pub const REPORTER_COOLDOWN_SECS: u64 = 86_400;
@@ -557,6 +1331,8 @@ pub const REPORTER_COOLDOWN_SECS: u64 = 86_400;
 pub const RESPOND_DEADLINE_SECS: u64 = 604_800;
 /// Seconds from response until the admin must resolve or dismiss (14 days).
 pub const RESOLVE_DEADLINE_SECS: u64 = 1_209_600;
+/// Maximum number of dispute IDs returned by a single `list_proof_disputes` call.
+pub const MAX_PROOF_DISPUTES_PAGE: u32 = 50;
 
 /// Dispute state transitions. Numeric values are stable on-chain identifiers;
 /// do not renumber existing variants.
@@ -598,10 +1374,12 @@ pub struct DisputeRecord {
     /// Categorised reason for the dispute.
     pub reason: DisputeReason,
     /// Privacy-safe commitment: H(reporter_address_bytes || proof_id_bytes).
-    /// The reporter's actual address is never stored on-chain.
+    /// Used for the per-proof cooldown and emitted in events.
     pub reporter_hash: BytesN<32>,
     /// Off-chain commitment to the reporter's full evidence submission.
     pub commitment_hash: BytesN<32>,
+    /// Address of the reporter who opened this dispute.
+    pub reporter: Address,
     /// Current lifecycle state.
     pub status: DisputeStatus,
     /// Ledger timestamp when the dispute was opened.
@@ -620,6 +1398,22 @@ pub struct DisputeRecord {
 }
 
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Timestamp claim events (#339) — commitments and ledger metadata only
+// ---------------------------------------------------------------------------
+
+#[contractevent(topics = ["timestamp", "anchor"])]
+pub struct TimestampClaimAnchored {
+    #[topic]
+    pub proof_id: BytesN<32>,
+    pub attestation_digest: BytesN<32>,
+    pub sources: u32,
+    pub assurance: u32,
+    pub anchored_at: u64,
+    pub ledger_sequence: u32,
+}
+
 // Dispute events (privacy-safe: commitments and timestamps only)
 // ---------------------------------------------------------------------------
 
@@ -671,6 +1465,71 @@ pub struct DisputeSuperseded {
     pub proof_id: BytesN<32>,
     pub superseded_by: BytesN<32>,
     pub resolved_at: u64,
+}
+
+// ---------------------------------------------------------------------------
+// Signed receipt digest commitment (#337)
+// ---------------------------------------------------------------------------
+
+/// Admin-managed receipt-signing key record. `public_key` is a SEC-1
+/// encoded uncompressed P-256 point (`0x04 || X || Y`); public keys are not
+/// secrets, and no private key material is ever stored.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReceiptSignerRecord {
+    pub public_key: BytesN<65>,
+    /// False once revoked. Revocation is recorded rather than deleted so an
+    /// operator can distinguish "revoked" from "never registered".
+    pub active: bool,
+    pub added_at: u64,
+    /// 0 while the signer is active.
+    pub revoked_at: u64,
+}
+
+/// Immutable commitment to a signed verification receipt for one proof.
+///
+/// Privacy: every field is a commitment, an address, an identifier, or a
+/// timestamp. No receipt bytes, media, metadata hashes, witness values,
+/// signatures, or private keys are stored.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReceiptCommitmentRecord {
+    pub proof_id: BytesN<32>,
+    /// `sha256(canonical_json(signed_verification_receipt))`.
+    pub receipt_digest: BytesN<32>,
+    /// Identity tier of the committed proof at commit time (1, 2, or 3).
+    pub tier: u32,
+    /// The attesting receipt-signing public key.
+    pub public_key: BytesN<65>,
+    /// Address that authorized the commit (proof subject or admin).
+    pub committed_by: Address,
+    pub committed_at: u64,
+}
+
+/// Emitted on the first successful commit for a proof. Idempotent retries
+/// emit nothing, so exactly one `["receipt", "commit"]` exists per proof.
+#[contractevent(topics = ["receipt", "commit"])]
+pub struct ReceiptDigestCommitted {
+    #[topic]
+    pub proof_id: BytesN<32>,
+    pub receipt_digest: BytesN<32>,
+    pub tier: u32,
+    pub public_key: BytesN<65>,
+    pub committed_at: u64,
+}
+
+#[contractevent(topics = ["signer", "add"])]
+pub struct ReceiptSignerAdded {
+    #[topic]
+    pub public_key: BytesN<65>,
+    pub added_at: u64,
+}
+
+#[contractevent(topics = ["signer", "revoke"])]
+pub struct ReceiptSignerRevocation {
+    #[topic]
+    pub public_key: BytesN<65>,
+    pub revoked_at: u64,
 }
 
 /// Schema record for issuer-certified attribute schemas.
@@ -745,33 +1604,53 @@ const SCOPED_NULLIFIER_V1_DOMAIN: [u8; 32] = [
 
 /// Protocol domain constant ("harpocrates" SHA-256 field element).
 pub const DOMAIN_PROTOCOL_FIELD: [u8; 32] = [
-    0x26, 0x1e, 0x9f, 0x6e, 0x39, 0xe3, 0xc1, 0xae,
-    0x6a, 0xca, 0x9f, 0x29, 0xe8, 0x4c, 0x10, 0xd5,
-    0x9c, 0x82, 0xd5, 0xf4, 0xb4, 0x0c, 0x21, 0xc1,
-    0xb7, 0xe3, 0xc0, 0x1a, 0xd5, 0x71, 0xc2, 0x01,
+    0x26, 0x1e, 0x9f, 0x6e, 0x39, 0xe3, 0xc1, 0xae, 0x6a, 0xca, 0x9f, 0x29, 0xe8, 0x4c, 0x10, 0xd5,
+    0x9c, 0x82, 0xd5, 0xf4, 0xb4, 0x0c, 0x21, 0xc1, 0xb7, 0xe3, 0xc0, 0x1a, 0xd5, 0x71, 0xc2, 0x01,
 ];
 
 /// Circuit version domain constant ("1" SHA-256 field element).
 pub const DOMAIN_VERSION_FIELD: [u8; 32] = [
-    0x0c, 0x89, 0xef, 0xf4, 0xec, 0x8e, 0x39, 0xa0,
-    0x1e, 0x9f, 0x19, 0x54, 0x7a, 0x0c, 0xc9, 0xdd,
-    0x7f, 0xd2, 0xa9, 0x7d, 0x79, 0xba, 0x4d, 0x94,
-    0xfd, 0x32, 0xe9, 0x7a, 0x1f, 0x5a, 0xc6, 0x23,
+    0x0c, 0x89, 0xef, 0xf4, 0xec, 0x8e, 0x39, 0xa0, 0x1e, 0x9f, 0x19, 0x54, 0x7a, 0x0c, 0xc9, 0xdd,
+    0x7f, 0xd2, 0xa9, 0x7d, 0x79, 0xba, 0x4d, 0x94, 0xfd, 0x32, 0xe9, 0x7a, 0x1f, 0x5a, 0xc6, 0x23,
 ];
 
 /// Target network domain constant ("testnet" SHA-256 field element).
 pub const DOMAIN_NETWORK_FIELD: [u8; 32] = [
-    0x2a, 0x2c, 0x3f, 0x48, 0xce, 0x2e, 0x3c, 0x2f,
-    0x1e, 0x6c, 0x89, 0xb1, 0x8d, 0x64, 0xb5, 0xf5,
-    0xc1, 0xf8, 0x8a, 0x59, 0xa0, 0xd9, 0xbc, 0x82,
-    0xcb, 0x61, 0xa1, 0xe8, 0xcb, 0x77, 0xa5, 0x0f,
+    0x2a, 0x2c, 0x3f, 0x48, 0xce, 0x2e, 0x3c, 0x2f, 0x1e, 0x6c, 0x89, 0xb1, 0x8d, 0x64, 0xb5, 0xf5,
+    0xc1, 0xf8, 0x8a, 0x59, 0xa0, 0xd9, 0xbc, 0x82, 0xcb, 0x61, 0xa1, 0xe8, 0xcb, 0x77, 0xa5, 0x0f,
 ];
 
 /// Expected length of v1 public inputs (5 × 32 = 160 bytes, including domain_tag).
 const SILENT_WITNESS_V1_INPUT_LEN: u32 = 160;
 
-/// Expected length of v2 scoped public inputs (7 × 32 = 224 bytes, including domain_tag).
-const SILENT_WITNESS_V2_INPUT_LEN: u32 = 224;
+/// Expected length of v1 browser public inputs (4 × 32 = 128 bytes, shipped in frontend/public/noir/silent_witness.json).
+const SILENT_WITNESS_BROWSER_V1_INPUT_LEN: u32 = 128;
+
+/// Length of the superseded bare v2 scoped frame (7 x 32 = 224 bytes, including
+/// domain_tag). It commits no circuit version, so a verifier could only *infer*
+/// one from the length. `register_anonymous_verified` rejects it outright with
+/// [`RegistryError::CircuitVersionMismatch`]; it is declared here only so that
+/// the rejection has a named, documented length instead of falling through to
+/// the generic `InvalidPublicInputs` arm.
+const SILENT_WITNESS_V2_BARE_INPUT_LEN: u32 = 224;
+
+/// Expected length of the circuit-versioned v2 envelope (#368): the 224-byte
+/// scoped frame plus a trailing 32-byte `circuit_version` field element. This
+/// is the `silent_witness/v2` frame of the canonical codec, so the length comes
+/// from [`verifier_inputs::SILENT_WITNESS_V2_PUBLIC_INPUTS_LEN`] rather than
+/// being restated here.
+///
+/// [`HarpocratesRegistry::register_anonymous_verified`] accepts only this frame
+/// for the v2 path; a trailer other than
+/// [`verifier_inputs::EXPECTED_CIRCUIT_VERSION`] is rejected with
+/// [`RegistryError::CircuitVersionMismatch`].
+const SILENT_WITNESS_V2_ENVELOPED_INPUT_LEN: u32 =
+    verifier_inputs::SILENT_WITNESS_V2_PUBLIC_INPUTS_LEN as u32;
+
+/// Byte offset of the trailing `circuit_version` field inside the envelope: the
+/// envelope is the scoped frame followed by exactly one field element.
+const CIRCUIT_VERSION_TRAILER_OFFSET: usize =
+    verifier_inputs::SILENT_WITNESS_V2_PUBLIC_INPUTS_LEN - verifier_inputs::FIELD_LEN;
 
 #[contractevent(topics = ["revroot", "set"])]
 pub struct RevocationRootSet {
@@ -809,6 +1688,9 @@ pub struct GuardianSet {
     #[topic]
     pub guardian: Address,
 }
+
+#[contractevent(topics = ["guardian", "clear"])]
+pub struct GuardianCleared {}
 
 #[contractevent(topics = ["admin", "propose"])]
 pub struct AdminProposed {
@@ -884,12 +1766,128 @@ pub struct TimelockEmergencyExec {
     pub executed_at: u64,
 }
 
-#[contractevent(topics = ["timelock", "delay", "set"])]
+// Two literal prefix topics max; the third is a `Symbol` field so the emitted
+// topic list stays exactly `["timelock", "delay", "set", set_by]`.
+#[contractevent(topics = ["timelock", "delay"])]
 pub struct TimelockMinDelaySet {
     pub previous_delay: u64,
     pub new_delay: u64,
     #[topic]
+    pub set: Symbol,
+    #[topic]
     pub set_by: Address,
+}
+
+// ---------------------------------------------------------------------------
+// Admin Council events and types
+// ---------------------------------------------------------------------------
+
+#[contractevent(topics = ["council", "set"])]
+pub struct AdminCouncilSet {
+    pub threshold: u32,
+    pub member_count: u32,
+    pub effective_at: u64,
+}
+
+#[contractevent(topics = ["council", "cancel_set"])]
+pub struct AdminCouncilCancelled {
+    #[topic]
+    pub admin: Address,
+    pub cancelled_at: u64,
+}
+
+#[contractevent(topics = ["council", "propose"])]
+pub struct CouncilProposalCreated {
+    #[topic]
+    pub proposal_id: u32,
+    pub action: u32,
+    #[topic]
+    pub proposer: Address,
+    pub target: Address,
+    pub created_at: u64,
+    pub expires_at: u64,
+}
+
+#[contractevent(topics = ["council", "approve"])]
+pub struct CouncilProposalApproved {
+    #[topic]
+    pub proposal_id: u32,
+    #[topic]
+    pub member: Address,
+    pub approval_count: u32,
+    pub threshold: u32,
+}
+
+#[contractevent(topics = ["council", "exec"])]
+pub struct CouncilProposalExecuted {
+    #[topic]
+    pub proposal_id: u32,
+    pub action: u32,
+    #[topic]
+    pub executed_by: Address,
+    pub executed_at: u64,
+}
+
+#[contractevent(topics = ["council", "cancel"])]
+pub struct CouncilProposalCancelled {
+    #[topic]
+    pub proposal_id: u32,
+    #[topic]
+    pub cancelled_by: Address,
+    pub cancelled_at: u64,
+    pub reason_code: CouncilCancellationReason,
+}
+
+/// Bounded, privacy-safe reasons for cancelling an admin council proposal.
+/// Numeric values are stable on-chain; do not renumber.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum CouncilCancellationReason {
+    /// Indicates that no reason was supplied; the compatibility entrypoint uses it.
+    LegacyUnspecified = 0,
+    Superseded = 1,
+    InvalidAction = 2,
+    SecurityConcern = 3,
+    NoLongerNeeded = 4,
+    Other = 5,
+}
+
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum CouncilAction {
+    SetVerifier = 1,
+    RevokeIssuer = 2,
+    UpgradeStorage = 3,
+    SetRevocationRoot = 4,
+    ScheduleVerifierRotation = 5,
+    ActivateVerifierRotation = 6,
+    RollbackVerifierRotation = 7,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminCouncil {
+    pub members: Vec<Address>,
+    pub threshold: u32,
+    pub created_at: u64,
+    pub effective_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CouncilProposal {
+    pub id: u32,
+    pub action: u32,
+    pub proposer: Address,
+    pub target: Address,
+    pub payload: BytesN<32>,
+    pub created_at: u64,
+    pub expires_at: u64,
+    pub approvals: Vec<Address>,
+    pub executed: bool,
+    pub cancelled: bool,
 }
 
 #[contracttype]
@@ -897,6 +1895,7 @@ pub struct TimelockMinDelaySet {
 #[repr(u32)]
 pub enum SchemaVersion {
     V1 = 1,
+    V2 = 2,
 }
 
 #[contractevent(topics = ["schema", "upgrade"])]
@@ -905,14 +1904,122 @@ pub struct SchemaUpgraded {
     pub current: u32,
 }
 
+#[contractevent(topics = ["contract", "upgrade"])]
+pub struct ContractUpgraded {
+    pub old_wasm_hash: BytesN<32>,
+    pub new_wasm_hash: BytesN<32>,
+}
+
+// ---------------------------------------------------------------------------
+// Paginated verifier-set inspection
+// ---------------------------------------------------------------------------
+//
+// `list_verifiers` returns a bounded, stable page of the current verifier
+// configuration — the active slot, the pending slot (if a rotation is
+// scheduled), and the previous slot (if within the rollback window).
+//
+// Design constraints:
+//   - Callers supply a u32 `cursor` (slot index, 0-based) and a `limit` (max
+//     entries per page). Cursor 0 starts at the first populated slot.
+//   - A cursor beyond the end of the populated slot list returns an empty
+//     page — not an error — so callers can safely probe with any cursor.
+//   - `limit` must be non-zero and at most MAX_VERIFIER_LIST_LIMIT.
+//   - No authentication is required (identical to `get_verifier`).
+//   - Slots are always ordered: Active → Pending → Previous.
+//     This ordering is stable across rotation events, so callers can page
+//     incrementally without re-reading prior pages.
+//   - Only populated (non-None) slots appear in `entries`, so the
+//     `next_cursor` can skip unpopulated slots.
+//   - `total_populated` exposes the total number of non-None slots at call
+//     time; it is informational only and safe to expose because addresses
+//     are already visible via `get_verifier` / `get_verifier_state`.
+//
+// Privacy invariants:
+//   - No private witness values, credential secrets, video hashes, or
+//     nullifiers are surfaced through this function.
+//   - An out-of-range cursor returns a stable empty page (not a
+//     revealing error) so a scanner cannot enumerate capacity by probing.
+//
+// Migration: These are new, additive storage keys and a new contract
+// entry point. Existing deployments return an empty VerifierPage until
+// `set_verifier` or a rotation is configured. Rolling back to a pre-this
+// wasm simply removes the entry point; callers fall back to `get_verifier`.
+
+/// Maximum number of verifier entries a single `list_verifiers` call may return.
+pub const MAX_VERIFIER_LIST_LIMIT: u32 = 10;
+
+/// The role of a verifier address in the current rotation state.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum VerifierRole {
+    Active = 1,
+    Pending = 2,
+    Previous = 3,
+}
+
+/// A single verifier slot returned by `list_verifiers`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifierEntry {
+    /// The verifier contract address for this slot.
+    pub address: Address,
+    /// The role of this verifier in the current configuration.
+    pub role: VerifierRole,
+}
+
+/// Paginated result from `list_verifiers`.
+///
+/// `entries` contains up to `limit` `VerifierEntry` items in slot order
+/// (Active → Pending → Previous). Only non-None slots are included.
+///
+/// `next_cursor` is `Some(offset)` when more items exist beyond this page,
+/// or `None` when the page is the last (or only) page. Pass `next_cursor`
+/// as the `cursor` argument in the subsequent call.
+///
+/// `total_populated` is the total count of populated (non-None) verifier
+/// slots at the time of the query. It is always ≤ 3.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifierPage {
+    pub entries: Vec<VerifierEntry>,
+    pub next_cursor: Option<u32>,
+    pub total_populated: u32,
+}
+
+#[contractevent(topics = ["ttl", "maintain"])]
+pub struct TTLMaintained {
+    pub count: u32,
+}
+
+#[contractevent(topics = ["ttl", "instance"])]
+pub struct InstanceTTLMaintained;
+
 #[contracttype]
 pub enum DataKey {
     Admin,
     Proof(BytesN<32>),
+    /// First effective revocation ledger; retain/restore with the proof row.
+    ProofRevocationLedger(BytesN<32>),
     Video(BytesN<32>),
     Nullifier(BytesN<32>),
     CredentialRoot(BytesN<32>),
+    CredentialRootV2(BytesN<32>),
+    /// Sequential counter for credential root index (#731).
+    CredentialRootSeq,
+    /// Credential root index entry by sequential ID (1-based) (#731).
+    CredentialRootIndex(u32),
+    /// Tracking index presence by root hash for idempotency (#731).
+    CredentialRootIndexed(BytesN<32>),
+    /// Staged credential roots for backfill during upgrade_storage (#731).
+    CredentialRootsBackfillQueue,
+    /// Cursor for backfill during upgrade_storage (#731).
+    CredentialRootsBackfillCursor,
+    /// Alias for backfill queue compatibility (#731).
+    CredentialRootsBackfill,
     Issuer(Address),
+    /// Rotation grace record for an issuer key that has rotated out (#323).
+    IssuerRotation(Address),
     Verifier,
     ProofTtl,
     /// Optional emergency-pause guardian, distinct from admin (#87).
@@ -920,30 +2027,70 @@ pub enum DataKey {
     /// Pause record for a single registration domain bit (#87).
     Pause(u32),
     PendingAdmin,
+    /// Optional expiry timestamp (Unix seconds) for `PendingAdmin`.
+    PendingAdminExpiry,
     /// Merkle root of the credential-revocation tree (set by admin).
     RevocationRoot,
     ProofHistorySeq(BytesN<32>),
     ProofHistoryEntry(BytesN<32>, u32),
+    AuthorityHistorySeq,
+    AuthorityHistoryEntry(u32),
+    ApproverAuthorityHistorySeq(Address),
+    ApproverAuthorityHistoryEntry(Address, u32),
     /// Scoped, expiring delegation from a grantor to a delegate (#192).
     Delegation(Address, Address),
     /// Count of distinct delegate addresses held by a grantor (#192).
     DelegationCount(Address),
     /// Verifier rotation state (schedule/activate/rollback).
     VerifierState,
+    /// Declared circuit-version window for the active verifier (#343).
+    VerifierCircuitVersions,
     /// Storage schema version.
     SchemaVersion,
+    /// Hash of the current active contract Wasm bytecode.
+    WasmHash,
     /// Scope epoch for verifier-scope binding.
     ScopeEpoch(BytesN<32>),
     /// Sequential counter for timelock proposal IDs (#86).
     ProposalSeq,
     /// Timelock proposal by sequential ID (#86).
     Proposal(u32),
+    /// Intent digest for a council proposal (#1184).
+    CouncilIntent(u32),
+    /// Intent digest for a timelock proposal (#1184).
+    TimelockIntent(u32),
     /// Minimum timelock delay in seconds (#86).
     TimelockMinDelay,
+    /// Active admin council configuration.
+    AdminCouncil,
+    /// Sequential counter for admin council proposal IDs.
+    CouncilProposalSeq,
+    /// Admin council proposal by ID.
+    CouncilProposal(u32),
+    /// Source batch root record.
+    SourceBatch(BytesN<32>),
+    /// Bounded recent revocation-root history.
+    RevocationRoots,
+    /// Grace window for recently superseded revocation roots.
+    RevocationRootGraceWindow,
+    /// Number of registered receipt signers.
+    ReceiptSignerCount,
+    /// Registration quota for an issuer key.
+    IssuerQuota(Address),
+    /// Current registration quota usage for an issuer key.
+    IssuerQuotaUsage(Address),
     /// Schema definition by schema hash.
     Schema(BytesN<32>),
     /// Verifiable derivative lineage record keyed by output digest.
     Lineage(BytesN<32>),
+    /// Independent timestamp claim keyed by proof_id (#339).
+    TimestampClaim(BytesN<32>),
+    /// Count of indexed children for a parent proof/digest (#335).
+    LineageChildSeq(BytesN<32>),
+    /// Count of derivatives already charged against a parent proof/digest.
+    LineageChildCount(BytesN<32>),
+    /// Child output digest at 1-based sequence for a parent (#335).
+    LineageChild(BytesN<32>, u32),
     /// Versioned metadata envelope binding keyed by proof_id (#317).
     MetadataEnvelope(BytesN<32>),
     /// Stores the `DisputeRecord` for a given dispute_id (#dispute).
@@ -951,9 +2098,22 @@ pub enum DataKey {
     /// Counts open (non-terminal) disputes for a proof_id (#dispute).
     /// Used to enforce MAX_OPEN_DISPUTES_PER_PROOF.
     ProofOpenDisputeCount(BytesN<32>),
+    /// Counts open (non-terminal) disputes across all proofs for a reporter Address.
+    /// Used to enforce MAX_OPEN_DISPUTES_PER_REPORTER.
+    ReporterOpenDisputeCount(Address),
     /// Tracks the last-opened timestamp for a reporter_hash/proof pair.
     /// Key is the caller-supplied `reporter_hash` (a 32-byte commitment).
     ReporterCooldown(BytesN<32>),
+    /// Scoped nullifier separated by verifier address context (#325).
+    VerifierNullifier(Address, BytesN<32>),
+    /// Sequential counter for disputes indexed under a proof_id (#dispute).
+    ProofDisputeSeq(BytesN<32>),
+    /// Dispute ID at 1-based sequence for a proof_id (#dispute).
+    ProofDispute(BytesN<32>, u32),
+    /// Active authority/role configuration revision.
+    RoleRevision,
+    /// Pending admin transition queued revision.
+    PendingAdminRevision,
 }
 
 #[contracterror]
@@ -1055,6 +2215,28 @@ pub enum RegistryError {
     ReporterOnCooldown = 66,
     /// The dispute is not in the state this transition requires.
     InvalidDisputeTransition = 67,
+    /// Timestamp claim is malformed, far-future, or missing required digest (#339).
+    InvalidTimestampClaim = 72,
+    /// No timestamp claim exists for the requested proof (#339).
+    TimestampClaimNotFound = 73,
+    /// A timestamp claim is already anchored and the update is not an upgrade (#339).
+    TimestampClaimAlreadyAnchored = 74,
+    /// Caller is neither admin nor the proof's source/issuer (#339).
+    UnauthorizedTimestampActor = 75,
+    /// Lineage registration supplied zero parents (commitments require ≥1).
+    LineageEmptyParents = 76,
+    /// A lineage parent proof is revoked or expired and cannot anchor a derivative.
+    LineageParentUnavailable = 77,
+    /// Lineage output digest is already registered.
+    DuplicateLineage = 78,
+    /// `list_lineage_children` limit was zero or above the page cap (#335).
+    LineageChildrenLimitExceeded = 79,
+    /// Parent already holds MAX_LINEAGE_CHILDREN_PER_PARENT children (#335).
+    LineageChildrenSaturated = 80,
+    /// Stored intent digest does not match the proposal's parameters (#1184).
+    IntentDigestMismatch = 90,
+    /// Proposal has no stored intent digest; refuse to execute (fail-closed) (#1184).
+    MissingIntentDigest = 91,
     /// Metadata envelope version is zero or above `METADATA_ENVELOPE_VERSION_MAX` (#317).
     UnsupportedMetadataEnvelopeVersion = 68,
     /// Metadata envelope hash is zero / malformed (#317).
@@ -1063,6 +2245,44 @@ pub enum RegistryError {
     MetadataEnvelopeNotFound = 70,
     /// Bound envelope hash does not match the proof's `metadata_hash` (#317).
     MetadataEnvelopeHashMismatch = 71,
+    /// Proof declares a circuit version outside the active verifier's window (#343).
+    UnsupportedCircuitVersion = 81,
+    /// Requested circuit-version window is empty or outside the wasm range (#343).
+    InvalidCircuitVersionRange = 82,
+    /// Requested rotation grace window is above `MAX_ISSUER_ROTATION_GRACE_SECS`
+    /// or overflows ledger time (#323).
+    InvalidIssuerRotationGrace = 83,
+    /// A rotation named the same issuer key twice; absent or inactive keys
+    /// report `UnknownIssuer` instead (#323).
+    InvalidIssuerRotation = 84,
+    /// No issuer rotation grace record exists for the requested key (#323).
+    IssuerRotationNotFound = 85,
+    /// The issuer rotation grace window has not lapsed yet (#323).
+    IssuerRotationGraceStillActive = 86,
+    /// A scoped-nullifier envelope carried a `circuit_version` trailer other
+    /// than [`verifier_inputs::EXPECTED_CIRCUIT_VERSION`], or was the superseded
+    /// bare 224-byte frame that commits no circuit version at all (#368).
+    CircuitVersionMismatch = 87,
+    /// The reporter reached `MAX_OPEN_DISPUTES_PER_REPORTER`.
+    ReporterDisputesSaturated = 88,
+    /// The action requires admin council threshold approvals.
+    InsufficientApprovals = 89,
+    /// The cursor supplied to `list_verifiers` is out of range or malformed.
+    InvalidCursor = 90,
+    /// The `limit` supplied to `list_verifiers` exceeds `MAX_VERIFIER_LIST_LIMIT`.
+    ListLimitExceeded = 91,
+    /// A credential root has expired and cannot be used.
+    ExpiredCredentialRoot = 92,
+    /// An operation conflicts with the configured institutional roles.
+    RoleConflict = 93,
+    /// A source-batch inclusion proof is invalid.
+    InvalidInclusionProof = 94,
+    /// The issuer's registration quota is exhausted for the current window.
+    IssuerQuotaExhausted = 95,
+    /// The claimed lineage depth does not match the depth derived from parents.
+    LineageDepthMismatch = 96,
+    /// A parent has reached its maximum number of derived children.
+    LineageFanOutSaturated = 97,
 }
 
 #[contract]
@@ -1070,6 +2290,40 @@ pub struct HarpocratesRegistry;
 
 #[contractimpl]
 impl HarpocratesRegistry {
+    pub fn get_registry_limits(_env: Env) -> RegistryLimits {
+        RegistryLimits {
+            silent_witness_v1_inputs_len: SILENT_WITNESS_PUBLIC_INPUTS_LEN as u32,
+            silent_witness_v2_inputs_len: SILENT_WITNESS_V2_PUBLIC_INPUTS_LEN as u32,
+            revocation_inputs_len: REVOCATION_PUBLIC_INPUTS_LEN as u32,
+            evidence_metadata_hash_bytes: MAX_EVIDENCE_METADATA_HASH_BYTES,
+            schema_version: METADATA_ENVELOPE_VERSION_MAX,
+        }
+    }
+
+    pub fn get_role_policy_digest(env: Env) -> BytesN<32> {
+        let now = env.ledger().timestamp();
+        let mut paused_domains = 0u32;
+        for bit in PAUSE_DOMAIN_SINGLE_BITS {
+            if domain_is_paused(&env, bit, now) {
+                paused_domains |= bit;
+            }
+        }
+
+        let storage = env.storage().persistent();
+        let policy = RolePolicy {
+            timelock_min_delay_secs: storage.get::<_, u64>(&DataKey::TimelockMinDelay).unwrap_or(DEFAULT_TIMELOCK_MIN_DELAY_SECS),
+            verifier: storage.get::<_, Address>(&DataKey::Verifier),
+            guardian: storage.get::<_, Address>(&DataKey::Guardian),
+            paused_domains,
+            schema_version: storage.get::<_, u32>(&DataKey::SchemaVersion).unwrap_or(SchemaVersion::V1 as u32),
+        };
+        
+        let mut bytes = Bytes::new(&env);
+        bytes.push(0x01); // Version 1
+        bytes.append(&policy.to_xdr(&env));
+        env.crypto().sha256(&bytes)
+    }
+
     pub fn init(env: Env, admin: Address) {
         if env.storage().persistent().has(&DataKey::Admin) {
             panic_with_error!(&env, RegistryError::AlreadyInitialized);
@@ -1079,7 +2333,10 @@ impl HarpocratesRegistry {
         env.storage().persistent().set(&DataKey::Admin, &admin);
         env.storage()
             .persistent()
-            .set(&DataKey::SchemaVersion, &(SchemaVersion::V1 as u32));
+            .set(&DataKey::SchemaVersion, &(SchemaVersion::V2 as u32));
+        env.storage()
+            .persistent()
+            .set(&DataKey::RoleRevision, &1u32);
     }
 
     /// Return the persistent storage schema version.
@@ -1108,6 +2365,9 @@ impl HarpocratesRegistry {
     /// stamped `SchemaVersion` intact; V1 readers treat it as authoritative.
     pub fn upgrade_storage(env: Env, admin: Address) {
         require_admin(&env, &admin);
+        if is_council_active(&env) {
+            panic_with_error!(&env, RegistryError::InsufficientApprovals);
+        }
 
         let had_version = env.storage().persistent().has(&DataKey::SchemaVersion);
         let current_version: u32 = env
@@ -1116,42 +2376,298 @@ impl HarpocratesRegistry {
             .get(&DataKey::SchemaVersion)
             .unwrap_or(SchemaVersion::V1 as u32);
 
-        let target_version = SchemaVersion::V1 as u32;
+        let target_version = SchemaVersion::V2 as u32;
 
         // Legacy pre-#85 registries: stamp V1 without a SchemaUpgraded event.
         if !had_version {
             env.storage()
                 .persistent()
-                .set(&DataKey::SchemaVersion, &target_version);
-            return;
+                .set(&DataKey::SchemaVersion, &(SchemaVersion::V1 as u32));
+            // Current version conceptually becomes V1 here
         }
 
-        if current_version < target_version {
+        let actual_current = if !had_version {
+            SchemaVersion::V1 as u32
+        } else {
+            current_version
+        };
+
+        if actual_current < target_version {
             // Migrations will be added here when moving to V2, V3, etc.
+            // V1 -> V2: Domain-separated nullifiers by verifier context (#325).
+            // Legacy nullifiers are preserved, so no iterative key rewrite is required.
+
+            // Revoke conflicting legacy issuer authority held by the admin (#414)
+            let admin_addr: Address = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Admin)
+                .unwrap_or_else(|| panic_with_error!(&env, RegistryError::NotInitialized));
+            let issuer_key = DataKey::Issuer(admin_addr.clone());
+            if let Some(mut issuer_rec) = env
+                .storage()
+                .persistent()
+                .get::<_, IssuerRecord>(&issuer_key)
+            {
+                if issuer_rec.active {
+                    issuer_rec.active = false;
+                    env.storage().persistent().set(&issuer_key, &issuer_rec);
+                    env.storage()
+                        .persistent()
+                        .remove(&DataKey::IssuerRotation(admin_addr.clone()));
+                    IssuerRevoked {
+                        issuer: admin_addr.clone(),
+                    }
+                    .publish(&env);
+                    record_authority_history(
+                        &env,
+                        &admin_addr,
+                        ROLE_ISSUER,
+                        TRANSITION_CONFLICT_REVOKED,
+                        Some(admin_addr.clone()),
+                        Some(issuer_rec.metadata_hash),
+                    );
+                }
+            }
 
             env.storage()
                 .persistent()
                 .set(&DataKey::SchemaVersion, &target_version);
 
             SchemaUpgraded {
-                previous: current_version,
+                previous: actual_current,
                 current: target_version,
             }
             .publish(&env);
+        }
+
+        // Backfill legacy credential roots into the index (bounded per call) (#731).
+        backfill_credential_roots_step(&env);
+    }
+
+    /// Return the active storage schema version. Legacy deployments that have
+    /// not called `upgrade_storage` report `V1`; fresh V2 deployments report `V2`.
+    pub fn get_schema_version(env: Env) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::SchemaVersion)
+            .unwrap_or(SchemaVersion::V1 as u32)
+    }
+
+    /// Return the registry's operational configuration in one read-only call (#721).
+    ///
+    /// Safe to call both before and after `init`. Every field matches the
+    /// corresponding individual getter, and `paused_domains` is the bitwise-OR
+    /// of all registration domains that are currently paused (unexpired).
+    pub fn get_config(env: Env) -> RegistryConfig {
+        let proof_ttl = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ProofTtl)
+            .unwrap_or(DEFAULT_PROOF_TTL_SECS);
+        let timelock_min_delay_secs = get_timelock_min_delay(&env);
+        let verifier: Option<Address> = env.storage().persistent().get(&DataKey::Verifier);
+        let verifier_state = get_verifier_rotation_state(&env);
+        let guardian: Option<Address> = env.storage().persistent().get(&DataKey::Guardian);
+        let schema_version = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SchemaVersion)
+            .unwrap_or(SchemaVersion::V1 as u32);
+        let revocation_root: Option<BytesN<32>> =
+            env.storage().persistent().get(&DataKey::RevocationRoot);
+
+        let now = env.ledger().timestamp();
+        let mut paused_domains = 0u32;
+        for bit in PAUSE_DOMAIN_SINGLE_BITS {
+            if domain_is_paused(&env, bit, now) {
+                paused_domains |= bit;
+            }
+        }
+
+        RegistryConfig {
+            proof_ttl,
+            timelock_min_delay_secs,
+            verifier,
+            verifier_state,
+            guardian,
+            schema_version,
+            revocation_root,
+            paused_domains,
         }
     }
 
     pub fn propose_admin(env: Env, admin: Address, pending_admin: Address) {
         require_admin(&env, &admin);
+        require_admin_role_available(&env, &pending_admin);
+
+        let current_revision = Self::get_role_revision(env.clone());
+
+        if let Some(existing_pending) = env
+            .storage()
+            .persistent()
+            .get::<_, Address>(&DataKey::PendingAdmin)
+        {
+            if existing_pending == pending_admin {
+                // Preserve an already queued compatible transition.
+                return;
+            }
+            let queued_revision: u32 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::PendingAdminRevision)
+                .unwrap_or(current_revision);
+            if queued_revision == current_revision {
+                // Reject conflicting role transitions queued for the same authority revision.
+                panic_with_error!(&env, RegistryError::RoleConflict);
+            }
+        }
 
         env.storage()
             .persistent()
             .set(&DataKey::PendingAdmin, &pending_admin);
+        env.storage().persistent().remove(&DataKey::PendingAdminExpiry);
         AdminProposed {
             pending_admin,
             current_admin: admin,
         }
         .publish(&env);
+    }
+
+    /// Propose a pending admin with a bounded expiry window (`duration_secs`).
+    ///
+    /// The invitation is active while `ledger().timestamp() < expires_at` and
+    /// becomes expired once `ledger().timestamp() >= expires_at`.
+    pub fn propose_admin_with_expiry(
+        env: Env,
+        admin: Address,
+        pending_admin: Address,
+        duration_secs: u64,
+    ) {
+        require_admin(&env, &admin);
+        require_admin_role_available(&env, &pending_admin);
+
+        if duration_secs == 0 || duration_secs > MAX_ROLE_INVITATION_TTL_SECS {
+            panic_with_error!(&env, RegistryError::InvalidRoleInvitationExpiry);
+        }
+        let expires_at = env
+            .ledger()
+            .timestamp()
+            .checked_add(duration_secs)
+            .unwrap_or_else(|| panic_with_error!(&env, RegistryError::InvalidRoleInvitationExpiry));
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::PendingAdmin, &pending_admin);
+        env.storage()
+            .persistent()
+            .set(&DataKey::PendingAdminExpiry, &expires_at);
+        AdminProposed {
+            pending_admin: pending_admin.clone(),
+            current_admin: admin.clone(),
+        }
+        .publish(&env);
+        record_authority_history(
+            &env,
+            &pending_admin,
+            ROLE_ADMIN,
+            TRANSITION_PROPOSED,
+            Some(admin),
+            None,
+        );
+    }
+
+    pub fn propose_admin_with_revision(
+        env: Env,
+        admin: Address,
+        pending_admin: Address,
+        expected_revision: u32,
+    ) {
+        let current_revision = Self::get_role_revision(env.clone());
+        if expected_revision != current_revision {
+            panic_with_error!(&env, RegistryError::RoleConflict);
+        }
+        Self::propose_admin(env, admin, pending_admin);
+    }
+
+    /// Return the current admin address, if initialized.
+    pub fn get_admin(env: Env) -> Option<Address> {
+        env.storage().persistent().get(&DataKey::Admin)
+    }
+
+    /// Return the active pending admin address, or `None` if no invitation
+    /// exists or the invitation has expired. Read-only: never mutates state.
+    pub fn get_pending_admin(env: Env) -> Option<Address> {
+        let pending_admin: Address = env.storage().persistent().get(&DataKey::PendingAdmin)?;
+        let expires_at: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PendingAdminExpiry)
+            .unwrap_or(0);
+        if expires_at != 0 && env.ledger().timestamp() >= expires_at {
+            None
+        } else {
+            Some(pending_admin)
+        }
+    }
+
+    /// Inspect the current admin role invitation status and expiry without
+    /// mutating contract state or performing hidden cleanup.
+    pub fn get_role_invitation(env: Env) -> RoleInvitationView {
+        let pending_admin: Option<Address> =
+            env.storage().persistent().get(&DataKey::PendingAdmin);
+        match pending_admin {
+            None => RoleInvitationView {
+                status: RoleInvitationStatus::Nonexistent,
+                pending_admin: None,
+                expires_at: 0,
+            },
+            Some(candidate) => {
+                let expires_at: u64 = env
+                    .storage()
+                    .persistent()
+                    .get(&DataKey::PendingAdminExpiry)
+                    .unwrap_or(0);
+                let status = if expires_at != 0 && env.ledger().timestamp() >= expires_at {
+                    RoleInvitationStatus::Expired
+                } else {
+                    RoleInvitationStatus::Active
+                };
+                RoleInvitationView {
+                    status,
+                    pending_admin: Some(candidate),
+                    expires_at,
+                }
+            }
+        }
+    }
+
+    /// Return the active authority/role configuration revision.
+    pub fn get_role_revision(env: Env) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::RoleRevision)
+            .unwrap_or(1u32)
+    }
+
+    /// Alias for get_role_revision.
+    pub fn get_authority_revision(env: Env) -> u32 {
+        Self::get_role_revision(env)
+    }
+
+    /// Return whether `address` holds the registry administrator role.
+    pub fn is_admin(env: Env, address: Address) -> bool {
+        let admin: Option<Address> = env.storage().persistent().get(&DataKey::Admin);
+        admin.as_ref() == Some(&address)
+    }
+
+    /// Return whether `address` holds an active Tier 3 issuer role.
+    pub fn is_issuer(env: Env, address: Address) -> bool {
+        let record: Option<IssuerRecord> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Issuer(address));
+        record.map_or(false, |r| r.active)
     }
 
     pub fn cancel_admin_transfer(env: Env, admin: Address) {
@@ -1163,11 +2679,20 @@ impl HarpocratesRegistry {
             .get(&DataKey::PendingAdmin)
             .unwrap_or_else(|| panic_with_error!(&env, RegistryError::NoPendingAdmin));
         env.storage().persistent().remove(&DataKey::PendingAdmin);
+        env.storage().persistent().remove(&DataKey::PendingAdminExpiry);
         AdminTransferCancelled {
-            pending_admin,
-            current_admin: admin,
+            pending_admin: pending_admin.clone(),
+            current_admin: admin.clone(),
         }
         .publish(&env);
+        record_authority_history(
+            &env,
+            &pending_admin,
+            ROLE_ADMIN,
+            TRANSITION_CANCELLED,
+            Some(admin),
+            None,
+        );
     }
 
     pub fn accept_admin(env: Env, pending_admin: Address) {
@@ -1181,6 +2706,25 @@ impl HarpocratesRegistry {
         if proposed_admin != pending_admin {
             panic_with_error!(&env, RegistryError::Unauthorized);
         }
+        let expires_at: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PendingAdminExpiry)
+            .unwrap_or(0);
+        if expires_at != 0 && env.ledger().timestamp() >= expires_at {
+            panic_with_error!(&env, RegistryError::RoleInvitationExpired);
+        }
+        require_admin_role_available(&env, &pending_admin);
+
+        let current_revision = Self::get_role_revision(env.clone());
+        let queued_revision: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PendingAdminRevision)
+            .unwrap_or(current_revision);
+        if queued_revision != current_revision {
+            panic_with_error!(&env, RegistryError::RoleConflict);
+        }
 
         let previous_admin: Address = env
             .storage()
@@ -1191,15 +2735,54 @@ impl HarpocratesRegistry {
             .persistent()
             .set(&DataKey::Admin, &pending_admin);
         env.storage().persistent().remove(&DataKey::PendingAdmin);
+        env.storage().persistent().remove(&DataKey::PendingAdminExpiry);
         AdminAccepted {
-            new_admin: pending_admin,
-            previous_admin,
+            new_admin: pending_admin.clone(),
+            previous_admin: previous_admin.clone(),
         }
         .publish(&env);
+        record_authority_history(
+            &env,
+            &previous_admin,
+            ROLE_ADMIN,
+            TRANSITION_REVOKED,
+            Some(pending_admin.clone()),
+            None,
+        );
+        record_authority_history(
+            &env,
+            &pending_admin,
+            ROLE_ADMIN,
+            TRANSITION_ACCEPTED,
+            Some(pending_admin),
+            None,
+        );
+    }
+
+    pub fn accept_admin_with_revision(
+        env: Env,
+        pending_admin: Address,
+        expected_revision: u32,
+    ) {
+        let current_revision = Self::get_role_revision(env.clone());
+        if expected_revision != current_revision {
+            panic_with_error!(&env, RegistryError::RoleConflict);
+        }
+        Self::accept_admin(env, pending_admin);
     }
 
     pub fn add_issuer(env: Env, admin: Address, issuer: Address, metadata_hash: BytesN<32>) {
         require_admin(&env, &admin);
+        require_issuer_role_available(&env, &issuer);
+        if env
+            .storage()
+            .persistent()
+            .get::<_, Address>(&DataKey::PendingAdmin)
+            .as_ref()
+            == Some(&issuer)
+        {
+            panic_with_error!(&env, RegistryError::RoleConflict);
+        }
 
         env.storage().persistent().set(
             &DataKey::Issuer(issuer.clone()),
@@ -1208,23 +2791,130 @@ impl HarpocratesRegistry {
                 active: true,
             },
         );
+        // Re-adding a key makes it the current key again, so a leftover
+        // rotation grace record for it would be a second, contradictory answer
+        // to `is_issuer_verifiable` (#323).
+        env.storage()
+            .persistent()
+            .remove(&DataKey::IssuerRotation(issuer.clone()));
         IssuerAdded {
-            issuer,
-            metadata_hash,
+            issuer: issuer.clone(),
+            metadata_hash: metadata_hash.clone(),
         }
         .publish(&env);
+        record_authority_history(
+            &env,
+            &issuer,
+            ROLE_ISSUER,
+            TRANSITION_ADDED,
+            Some(admin),
+            Some(metadata_hash),
+        );
     }
 
     pub fn set_verifier(env: Env, admin: Address, verifier: Address) {
         require_admin(&env, &admin);
+        if is_council_active(&env) {
+            panic_with_error!(&env, RegistryError::InsufficientApprovals);
+        }
 
-        env.storage().persistent().set(&DataKey::Verifier, &verifier);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Verifier, &verifier);
         env.storage().persistent().remove(&DataKey::VerifierState);
+        // A freshly configured verifier has not declared a window yet; fall
+        // back to the full built-in range rather than inheriting the previous
+        // verifier's claim.
+        env.storage()
+            .persistent()
+            .remove(&DataKey::VerifierCircuitVersions);
         VerifierSet { verifier }.publish(&env);
     }
 
     pub fn get_verifier(env: Env) -> Option<Address> {
         env.storage().persistent().get(&DataKey::Verifier)
+    }
+
+    /// Declare the circuit-version window the active verifier can check (#343).
+    ///
+    /// Admin-only and additive. `min_version..=max_version` must lie inside
+    /// this wasm build's own supported range; an empty or out-of-range window
+    /// fails with the stable `InvalidCircuitVersionRange` code rather than
+    /// being silently clamped. Once declared, every proof-verifying entry point
+    /// refuses a proof whose circuit version falls outside the window *before*
+    /// the external verifier is invoked, so an unsupported version can never
+    /// reach a dependency that cannot answer.
+    ///
+    /// Restore the default by setting the window back to
+    /// `MIN_SUPPORTED_CIRCUIT_VERSION..=MAX_SUPPORTED_CIRCUIT_VERSION`.
+    pub fn set_verifier_circuit_versions(
+        env: Env,
+        admin: Address,
+        min_version: u32,
+        max_version: u32,
+    ) {
+        require_admin(&env, &admin);
+
+        if min_version > max_version
+            || min_version < MIN_SUPPORTED_CIRCUIT_VERSION
+            || max_version > MAX_SUPPORTED_CIRCUIT_VERSION
+        {
+            panic_with_error!(&env, RegistryError::InvalidCircuitVersionRange);
+        }
+
+        let verifier = get_active_verifier(&env);
+        env.storage().persistent().set(
+            &DataKey::VerifierCircuitVersions,
+            &VerifierCircuitVersions {
+                min_version,
+                max_version,
+                set_by: admin,
+                set_at: env.ledger().timestamp(),
+            },
+        );
+        VerifierCircuitVersionsSet {
+            verifier,
+            min_version,
+            max_version,
+        }
+        .publish(&env);
+    }
+
+    /// The active verifier's circuit-version window (#343).
+    ///
+    /// An undeclared window answers as the full built-in range, so a pre-#343
+    /// deployment reports what it actually enforces instead of erroring.
+    pub fn get_verifier_circuit_versions(env: Env) -> VerifierCircuitVersions {
+        match env
+            .storage()
+            .persistent()
+            .get::<DataKey, VerifierCircuitVersions>(&DataKey::VerifierCircuitVersions)
+        {
+            Some(record) => record,
+            None => VerifierCircuitVersions {
+                min_version: MIN_SUPPORTED_CIRCUIT_VERSION,
+                max_version: MAX_SUPPORTED_CIRCUIT_VERSION,
+                set_by: env
+                    .storage()
+                    .persistent()
+                    .get(&DataKey::Admin)
+                    .unwrap_or_else(|| panic_with_error!(&env, RegistryError::NotInitialized)),
+                set_at: 0,
+            },
+        }
+    }
+
+    /// Read-only: may a proof carrying `version` be accepted right now?
+    ///
+    /// True only when `version` is both framable by this wasm build and inside
+    /// the active verifier's declared window. Callers can pre-flight without a
+    /// trial transaction.
+    pub fn is_supported_circuit_version(env: Env, version: u32) -> bool {
+        if version < MIN_SUPPORTED_CIRCUIT_VERSION || version > MAX_SUPPORTED_CIRCUIT_VERSION {
+            return false;
+        }
+        let (min_version, max_version) = get_verifier_circuit_versions_raw(&env);
+        version >= min_version && version <= max_version
     }
 
     pub fn schedule_verifier_rotation(
@@ -1236,6 +2926,9 @@ impl HarpocratesRegistry {
         rollback_window: u64,
     ) {
         require_admin(&env, &admin);
+        if is_council_active(&env) {
+            panic_with_error!(&env, RegistryError::InsufficientApprovals);
+        }
 
         let active_verifier = get_active_verifier(&env);
         let state = VerifierState {
@@ -1247,7 +2940,9 @@ impl HarpocratesRegistry {
             rollback_window,
             rollback_window_end: activation_ledger.saturating_add(rollback_window),
         };
-        env.storage().persistent().set(&DataKey::VerifierState, &state);
+        env.storage()
+            .persistent()
+            .set(&DataKey::VerifierState, &state);
         VerifierRotationScheduled {
             active_verifier: active_verifier.clone(),
             pending_verifier: verifier.clone(),
@@ -1260,14 +2955,19 @@ impl HarpocratesRegistry {
 
     pub fn activate_verifier_rotation(env: Env, admin: Address) {
         require_admin(&env, &admin);
+        if is_council_active(&env) {
+            panic_with_error!(&env, RegistryError::InsufficientApprovals);
+        }
 
         let mut state = get_verifier_rotation_state(&env);
-        let pending_verifier = state.pending_verifier.clone().unwrap_or_else(|| {
-            panic_with_error!(&env, RegistryError::RotationNotScheduled)
-        });
-        let active_verifier = state.active_verifier.clone().unwrap_or_else(|| {
-            panic_with_error!(&env, RegistryError::RotationNotScheduled)
-        });
+        let pending_verifier = state
+            .pending_verifier
+            .clone()
+            .unwrap_or_else(|| panic_with_error!(&env, RegistryError::RotationNotScheduled));
+        let active_verifier = state
+            .active_verifier
+            .clone()
+            .unwrap_or_else(|| panic_with_error!(&env, RegistryError::RotationNotScheduled));
         let current_ledger = u64::from(env.ledger().sequence());
         if current_ledger < state.activation_ledger {
             panic_with_error!(&env, RegistryError::RotationNotReady);
@@ -1276,8 +2976,17 @@ impl HarpocratesRegistry {
         state.active_verifier = Some(pending_verifier.clone());
         state.pending_verifier = None;
         state.rollback_window_end = current_ledger.saturating_add(state.rollback_window.max(0));
-        env.storage().persistent().set(&DataKey::VerifierState, &state);
-        env.storage().persistent().set(&DataKey::Verifier, &pending_verifier);
+        env.storage()
+            .persistent()
+            .set(&DataKey::VerifierState, &state);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Verifier, &pending_verifier);
+        // The incoming verifier must declare its own window; do not inherit the
+        // outgoing verifier's circuit-version claim.
+        env.storage()
+            .persistent()
+            .remove(&DataKey::VerifierCircuitVersions);
         VerifierRotationActivated {
             active_verifier: pending_verifier,
             previous_verifier: active_verifier,
@@ -1288,21 +2997,31 @@ impl HarpocratesRegistry {
 
     pub fn rollback_verifier_rotation(env: Env, admin: Address) {
         require_admin(&env, &admin);
+        if is_council_active(&env) {
+            panic_with_error!(&env, RegistryError::InsufficientApprovals);
+        }
 
         let state = get_verifier_rotation_state(&env);
-        let active_verifier = state.active_verifier.clone().unwrap_or_else(|| {
-            panic_with_error!(&env, RegistryError::RotationNotScheduled)
-        });
-        let previous_verifier = state.previous_verifier.clone().unwrap_or_else(|| {
-            panic_with_error!(&env, RegistryError::RotationNotScheduled)
-        });
+        let active_verifier = state
+            .active_verifier
+            .clone()
+            .unwrap_or_else(|| panic_with_error!(&env, RegistryError::RotationNotScheduled));
+        let previous_verifier = state
+            .previous_verifier
+            .clone()
+            .unwrap_or_else(|| panic_with_error!(&env, RegistryError::RotationNotScheduled));
         let current_ledger = u64::from(env.ledger().sequence());
         if state.rollback_window_end == 0 || current_ledger > state.rollback_window_end {
             panic_with_error!(&env, RegistryError::RotationWindowClosed);
         }
 
-        env.storage().persistent().set(&DataKey::Verifier, &previous_verifier);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Verifier, &previous_verifier);
         env.storage().persistent().remove(&DataKey::VerifierState);
+        env.storage()
+            .persistent()
+            .remove(&DataKey::VerifierCircuitVersions);
         VerifierRotationRolledBack {
             active_verifier: previous_verifier.clone(),
             previous_verifier: active_verifier,
@@ -1324,13 +3043,15 @@ impl HarpocratesRegistry {
 
         let issued_at = env.ledger().timestamp();
         env.storage().persistent().set(
-            &DataKey::CredentialRoot(credential_root.clone()),
+            &DataKey::CredentialRootV2(credential_root.clone()),
             &CredentialRootRecord {
                 metadata_hash: metadata_hash.clone(),
-                active: true,
+                status: STATUS_REGISTERED,
                 issued_at,
+                expires_at: 0,
             },
         );
+        index_credential_root(&env, &credential_root);
         CredentialRootAdded {
             credential_root,
             metadata_hash,
@@ -1343,11 +3064,23 @@ impl HarpocratesRegistry {
         require_admin(&env, &admin);
 
         let mut record = get_credential_root_record(&env, &credential_root);
-        record.active = false;
+        record.status = STATUS_REVOKED;
         env.storage()
             .persistent()
-            .set(&DataKey::CredentialRoot(credential_root.clone()), &record);
+            .set(&DataKey::CredentialRootV2(credential_root.clone()), &record);
         CredentialRootRevoked { credential_root }.publish(&env);
+    }
+
+    pub fn expire_credential_root(env: Env, admin: Address, credential_root: BytesN<32>) {
+        require_admin(&env, &admin);
+
+        let mut record = get_credential_root_record(&env, &credential_root);
+        record.status = STATUS_EXPIRED;
+        record.expires_at = env.ledger().timestamp();
+        env.storage()
+            .persistent()
+            .set(&DataKey::CredentialRootV2(credential_root.clone()), &record);
+        CredentialRootExpired { credential_root, expired_at: record.expires_at }.publish(&env);
     }
 
     pub fn get_credential_root(
@@ -1359,15 +3092,361 @@ impl HarpocratesRegistry {
             .get(&DataKey::CredentialRoot(credential_root))
     }
 
+    /// Return the total number of indexed credential roots (#731).
+    pub fn get_credential_root_count(env: Env) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::CredentialRootSeq)
+            .unwrap_or(0u32)
+    }
+
+    /// Enumerate credential roots and their current statuses across sequential IDs (#731).
+    ///
+    /// - `cursor`: ID offset to start scanning from (1-based sequential IDs).
+    ///   If `cursor == 0`, scanning begins at ID 1.
+    /// - `limit`: maximum number of roots to return; capped at `MAX_CREDENTIAL_ROOTS_PAGE`.
+    ///   If 0 or exceeding the cap, `limit` is clamped to `MAX_CREDENTIAL_ROOTS_PAGE`.
+    /// - Non-existent/deleted entries are skipped.
+    /// - Read-only query; no auth required.
+    pub fn list_credential_roots(
+        env: Env,
+        cursor: u32,
+        limit: u32,
+    ) -> CredentialRootPage {
+        let effective_limit = if limit == 0 || limit > MAX_CREDENTIAL_ROOTS_PAGE {
+            MAX_CREDENTIAL_ROOTS_PAGE
+        } else {
+            limit
+        };
+
+        let total_seq: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CredentialRootSeq)
+            .unwrap_or(0u32);
+
+        let mut roots = SorobanVec::new(&env);
+        let mut next_cursor: Option<u32> = None;
+
+        let mut id = if cursor == 0 { 1u32 } else { cursor };
+
+        while id <= total_seq {
+            if let Some(root) = env
+                .storage()
+                .persistent()
+                .get::<_, BytesN<32>>(&DataKey::CredentialRootIndex(id))
+            {
+                if let Some(record) = get_credential_root_record_opt(&env, &root) {
+                    let status = if record.status == STATUS_EXPIRED
+                        || (record.expires_at > 0 && env.ledger().timestamp() >= record.expires_at)
+                    {
+                        STATUS_EXPIRED
+                    } else {
+                        record.status
+                    };
+                    roots.push_back(CredentialRootEntry {
+                        root_hash: root,
+                        status,
+                    });
+                    if roots.len() == effective_limit {
+                        if id < total_seq {
+                            next_cursor = Some(id + 1);
+                        }
+                        break;
+                    }
+                }
+            }
+            id = id.saturating_add(1);
+        }
+
+        CredentialRootPage {
+            roots,
+            next_cursor,
+        }
+    }
+
+    /// Stage or queue legacy credential roots for bounded backfill during `upgrade_storage` (#731).
+    pub fn stage_roots_for_backfill(env: Env, admin: Address, roots: Vec<BytesN<32>>) {
+        require_admin(&env, &admin);
+        let backfill_key = DataKey::CredentialRootsBackfillQueue;
+        let mut queue: SorobanVec<BytesN<32>> = env
+            .storage()
+            .persistent()
+            .get(&backfill_key)
+            .unwrap_or_else(|| SorobanVec::new(&env));
+        for r in roots.iter() {
+            queue.push_back(r);
+        }
+        env.storage().persistent().set(&backfill_key, &queue);
+    }
+
     pub fn revoke_issuer(env: Env, admin: Address, issuer: Address) {
         require_admin(&env, &admin);
+        if is_council_active(&env) {
+            panic_with_error!(&env, RegistryError::InsufficientApprovals);
+        }
 
         let mut record = get_issuer_record(&env, &issuer);
         record.active = false;
         env.storage()
             .persistent()
             .set(&DataKey::Issuer(issuer.clone()), &record);
-        IssuerRevoked { issuer }.publish(&env);
+        // Revocation outranks any rotation grace window: a withdrawn or
+        // compromised key must never keep standing through a rotation record
+        // (#323).
+        env.storage()
+            .persistent()
+            .remove(&DataKey::IssuerRotation(issuer.clone()));
+        IssuerRevoked { issuer: issuer.clone() }.publish(&env);
+        record_authority_history(
+            &env,
+            &issuer,
+            ROLE_ISSUER,
+            TRANSITION_REVOKED,
+            Some(admin),
+            Some(record.metadata_hash),
+        );
+    }
+
+    /// Update an active issuer's metadata hash.
+    ///
+    /// Requires admin auth and that `issuer` is active.
+    /// Only the metadata hash changes; active status and any rotation grace
+    /// records are preserved.
+    ///
+    /// # Reverts
+    ///
+    /// - `Unauthorized` if `admin` is not the current admin
+    /// - `UnknownIssuer` if `issuer` does not exist or is inactive
+    pub fn update_issuer_metadata(
+        env: Env,
+        admin: Address,
+        issuer: Address,
+        metadata_hash: BytesN<32>,
+    ) {
+        require_admin(&env, &admin);
+
+        let mut record = get_issuer_record(&env, &issuer);
+        if !record.active {
+            panic_with_error!(&env, RegistryError::UnknownIssuer);
+        }
+
+        let previous_metadata_hash = record.metadata_hash;
+        record.metadata_hash = metadata_hash.clone();
+        env.storage()
+            .persistent()
+            .set(&DataKey::Issuer(issuer.clone()), &record);
+
+        IssuerMetadataUpdated {
+            issuer: issuer.clone(),
+            previous_metadata_hash,
+            new_metadata_hash: metadata_hash.clone(),
+        }
+        .publish(&env);
+        record_authority_history(
+            &env,
+            &issuer,
+            ROLE_ISSUER,
+            TRANSITION_METADATA_UPDATED,
+            Some(admin),
+            Some(metadata_hash),
+        );
+    }
+
+    /// Rotate an active issuer key to a replacement, opening a bounded grace
+    /// window over the retiring key's pre-rotation evidence (#323).
+    ///
+    /// Admin-only. `previous_issuer` and `replacement_issuer` must be distinct,
+    /// both registered, and both active. The rotation retires `previous_issuer`
+    /// immediately — it can no longer sign new seals, directly or through a
+    /// delegation — while the evidence it already signed stays verifiable until
+    /// `grace_expires_at`, after which [`Self::is_issuer_verifiable`] fails
+    /// closed.
+    ///
+    /// `grace_secs == 0` selects [`DEFAULT_ISSUER_ROTATION_GRACE_SECS`].
+    /// Returns the absolute `grace_expires_at` so a caller can record the
+    /// deadline without re-reading storage. The window is lazy — it lapses with
+    /// no transaction — and [`Self::finalize_issuer_rotation`] settles the
+    /// record afterwards.
+    ///
+    /// # Reverts
+    ///
+    /// - `Unauthorized`               if the caller is not the admin
+    /// - `InvalidIssuerRotation`      if previous and replacement are equal
+    /// - `UnknownIssuer`              if either key is absent or inactive
+    /// - `InvalidIssuerRotationGrace` if `grace_secs` exceeds
+    ///   [`MAX_ISSUER_ROTATION_GRACE_SECS`] or the window would overflow ledger
+    ///   time
+    pub fn rotate_issuer(
+        env: Env,
+        admin: Address,
+        previous_issuer: Address,
+        replacement_issuer: Address,
+        grace_secs: u64,
+    ) -> u64 {
+        require_admin(&env, &admin);
+
+        if previous_issuer == replacement_issuer {
+            panic_with_error!(&env, RegistryError::InvalidIssuerRotation);
+        }
+
+        let mut previous = get_issuer_record(&env, &previous_issuer);
+        if !previous.active {
+            panic_with_error!(&env, RegistryError::UnknownIssuer);
+        }
+        let replacement = get_issuer_record(&env, &replacement_issuer);
+        if !replacement.active {
+            panic_with_error!(&env, RegistryError::UnknownIssuer);
+        }
+
+        // `0` means "use the protocol default", never "no window": a rotation
+        // that left pre-rotation evidence unverifiable in the same transaction
+        // would break the boundary this feature exists to keep.
+        let resolved_grace = if grace_secs == 0 {
+            DEFAULT_ISSUER_ROTATION_GRACE_SECS
+        } else {
+            grace_secs
+        };
+        if resolved_grace > MAX_ISSUER_ROTATION_GRACE_SECS {
+            panic_with_error!(&env, RegistryError::InvalidIssuerRotationGrace);
+        }
+
+        let rotated_at = env.ledger().timestamp();
+        let grace_expires_at = rotated_at
+            .checked_add(resolved_grace)
+            .unwrap_or_else(|| panic_with_error!(&env, RegistryError::InvalidIssuerRotationGrace));
+
+        // Retire the previous key immediately: a rotated-out key must not sign
+        // anything new, grace window or not.
+        previous.active = false;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Issuer(previous_issuer.clone()), &previous);
+
+        env.storage().persistent().set(
+            &DataKey::IssuerRotation(previous_issuer.clone()),
+            &IssuerRotationRecord {
+                previous_issuer: previous_issuer.clone(),
+                replacement_issuer: replacement_issuer.clone(),
+                rotated_at,
+                grace_expires_at,
+                grace_secs: resolved_grace,
+            },
+        );
+
+        IssuerRotated {
+            previous_issuer: previous_issuer.clone(),
+            replacement_issuer: replacement_issuer.clone(),
+            rotated_at,
+            grace_expires_at,
+            grace_secs: resolved_grace,
+        }
+        .publish(&env);
+
+        record_authority_history(
+            &env,
+            &previous_issuer,
+            ROLE_ISSUER,
+            TRANSITION_ROTATED,
+            Some(admin.clone()),
+            Some(previous.metadata_hash),
+        );
+        record_authority_history(
+            &env,
+            &replacement_issuer,
+            ROLE_ISSUER,
+            TRANSITION_ADDED,
+            Some(admin),
+            Some(replacement.metadata_hash),
+        );
+
+        grace_expires_at
+    }
+
+    /// Settle a lapsed issuer-rotation grace window (#323).
+    ///
+    /// Permissionless by design: the transition is fully determined by the
+    /// stored `grace_expires_at`, so any caller may close the record once the
+    /// window has lapsed, and no admin key is needed to stop a retired key from
+    /// holding standing. Callable at exactly `grace_expires_at` and after it;
+    /// the record is removed and `IssuerRotationGraceExpired` is published.
+    ///
+    /// # Reverts
+    ///
+    /// - `IssuerRotationNotFound`         if no rotation record exists
+    /// - `IssuerRotationGraceStillActive` if the window has not lapsed
+    pub fn finalize_issuer_rotation(env: Env, issuer: Address) {
+        let record: IssuerRotationRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::IssuerRotation(issuer.clone()))
+            .unwrap_or_else(|| panic_with_error!(&env, RegistryError::IssuerRotationNotFound));
+
+        if env.ledger().timestamp() < record.grace_expires_at {
+            panic_with_error!(&env, RegistryError::IssuerRotationGraceStillActive);
+        }
+
+        env.storage()
+            .persistent()
+            .remove(&DataKey::IssuerRotation(issuer.clone()));
+
+        IssuerRotationGraceExpired {
+            issuer: issuer.clone(),
+            replacement_issuer: record.replacement_issuer,
+            grace_expires_at: record.grace_expires_at,
+        }
+        .publish(&env);
+
+        record_authority_history(
+            &env,
+            &issuer,
+            ROLE_ISSUER,
+            TRANSITION_FINALIZED,
+            None,
+            None,
+        );
+    }
+
+    /// The rotation grace record for `issuer`, when the key has rotated out and
+    /// the window has not been settled yet (#323).
+    ///
+    /// `None` for an unknown key, an active key, a revoked key, and a key whose
+    /// lapsed window was already finalized. In each of those cases
+    /// [`Self::is_issuer_verifiable`] is the read that decides standing.
+    pub fn get_issuer_rotation(env: Env, issuer: Address) -> Option<IssuerRotationRecord> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::IssuerRotation(issuer))
+    }
+
+    /// Whether `issuer` may still anchor verification of evidence it issued
+    /// (#323).
+    ///
+    /// True while the registry lists the issuer as active, and true for a
+    /// rotated-out key until its grace window lapses. False for an unknown key,
+    /// a revoked key, and a key at or past `grace_expires_at` — a lapsed window
+    /// fails closed rather than being silently extended. Never panics, so a
+    /// caller can pre-flight an unknown, revoked, or unsupported issuer without
+    /// risking a reverted transaction.
+    pub fn is_issuer_verifiable(env: Env, issuer: Address) -> bool {
+        let record: Option<IssuerRecord> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Issuer(issuer.clone()));
+        match record {
+            None => false,
+            Some(current) if current.active => true,
+            Some(_) => {
+                let rotation: Option<IssuerRotationRecord> = env
+                    .storage()
+                    .persistent()
+                    .get(&DataKey::IssuerRotation(issuer));
+                match rotation {
+                    Some(window) => env.ledger().timestamp() < window.grace_expires_at,
+                    None => false,
+                }
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1393,10 +3472,14 @@ impl HarpocratesRegistry {
     // -----------------------------------------------------------------------
 
     pub fn propose_timelocked_action(
-        env: Env, admin: Address, action: u32, target: Address, payload: BytesN<32>,
+        env: Env,
+        admin: Address,
+        action: u32,
+        target: Address,
+        payload: BytesN<32>,
     ) -> u32 {
         require_admin(&env, &admin);
-        if action == 0 || action > 4 {
+        if action == 0 || action > 6 || action == 5 {
             panic_with_error!(&env, RegistryError::InvalidProposalAction);
         }
         let pending_count: u32 = count_pending_proposals(&env);
@@ -1407,17 +3490,37 @@ impl HarpocratesRegistry {
         let min_delay = get_timelock_min_delay(&env);
         let proposal_id = next_proposal_id(&env);
         let proposal = TimelockProposal {
-            action, proposer: admin.clone(), target, payload,
+            action,
+            proposer: admin.clone(),
+            target,
+            payload,
             created_at: now,
             min_execution_at: now.saturating_add(min_delay),
-            executed: false, cancelled: false,
+            executed: false,
+            cancelled: false,
         };
-        env.storage().persistent().set(&DataKey::Proposal(proposal_id), &proposal);
+        let intent = intent_digest(
+            &env,
+            TIMELOCK_INTENT_DOMAIN,
+            proposal.action,
+            &proposal.target,
+            &proposal.payload,
+        );
+        env.storage()
+            .persistent()
+            .set(&DataKey::TimelockIntent(proposal_id), &intent);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Proposal(proposal_id), &proposal);
         TimelockProposalCreated {
-            proposal_id, action, proposer: admin,
-            target: proposal.target, created_at: now,
+            proposal_id,
+            action,
+            proposer: admin,
+            target: proposal.target,
+            created_at: now,
             min_execution_at: proposal.min_execution_at,
-        }.publish(&env);
+        }
+        .publish(&env);
         proposal_id
     }
 
@@ -1431,11 +3534,16 @@ impl HarpocratesRegistry {
             panic_with_error!(&env, RegistryError::AlreadyCancelled);
         }
         proposal.cancelled = true;
-        env.storage().persistent().set(&DataKey::Proposal(proposal_id), &proposal);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Proposal(proposal_id), &proposal);
         TimelockProposalCancelled {
-            proposal_id, action: proposal.action,
-            cancelled_by: admin, cancelled_at: env.ledger().timestamp(),
-        }.publish(&env);
+            proposal_id,
+            action: proposal.action,
+            cancelled_by: admin,
+            cancelled_at: env.ledger().timestamp(),
+        }
+        .publish(&env);
     }
 
     pub fn execute_timelocked_proposal(env: Env, caller: Address, proposal_id: u32) {
@@ -1450,20 +3558,43 @@ impl HarpocratesRegistry {
         if now < proposal.min_execution_at {
             panic_with_error!(&env, RegistryError::ProposalNotReady);
         }
+        if is_council_active(&env) && (proposal.action == 1 || proposal.action == 2) {
+            panic_with_error!(&env, RegistryError::InsufficientApprovals);
+        }
+        // Intent digest: bind execution to the approved parameters (#1184).
+        let stored_intent: BytesN<32> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TimelockIntent(proposal_id))
+            .unwrap_or_else(|| panic_with_error!(&env, RegistryError::MissingIntentDigest));
+        let recomputed = intent_digest(
+            &env,
+            TIMELOCK_INTENT_DOMAIN,
+            proposal.action,
+            &proposal.target,
+            &proposal.payload,
+        );
+        if recomputed != stored_intent {
+            panic_with_error!(&env, RegistryError::IntentDigestMismatch);
+        }
+
         let mut mutable_proposal = proposal.clone();
         mutable_proposal.executed = true;
-        env.storage().persistent().set(&DataKey::Proposal(proposal_id), &mutable_proposal);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Proposal(proposal_id), &mutable_proposal);
         caller.require_auth();
         dispatch_timelocked_action(&env, &proposal);
         TimelockProposalExecuted {
-            proposal_id, action: proposal.action,
-            executed_by: caller, executed_at: now,
-        }.publish(&env);
+            proposal_id,
+            action: proposal.action,
+            executed_by: caller,
+            executed_at: now,
+        }
+        .publish(&env);
     }
 
-    pub fn emergency_execute_timelocked_proposal(
-        env: Env, admin: Address, proposal_id: u32,
-    ) {
+    pub fn emergency_execute_timelock(env: Env, admin: Address, proposal_id: u32) {
         require_admin(&env, &admin);
         let proposal = get_timelock_proposal_or_panic(&env, proposal_id);
         if proposal.executed {
@@ -1472,22 +3603,109 @@ impl HarpocratesRegistry {
         if proposal.cancelled {
             panic_with_error!(&env, RegistryError::ProposalCancelled);
         }
+        if proposal.action == ProposalAction::UpgradeWasm as u32 {
+            panic_with_error!(&env, RegistryError::InvalidProposalAction);
+        }
+        // Intent digest: the emergency path is not a bypass (#1184).
+        let stored_intent: BytesN<32> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TimelockIntent(proposal_id))
+            .unwrap_or_else(|| panic_with_error!(&env, RegistryError::MissingIntentDigest));
+        let recomputed = intent_digest(
+            &env,
+            TIMELOCK_INTENT_DOMAIN,
+            proposal.action,
+            &proposal.target,
+            &proposal.payload,
+        );
+        if recomputed != stored_intent {
+            panic_with_error!(&env, RegistryError::IntentDigestMismatch);
+        }
+
         let mut mutable_proposal = proposal.clone();
         mutable_proposal.executed = true;
-        env.storage().persistent().set(&DataKey::Proposal(proposal_id), &mutable_proposal);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Proposal(proposal_id), &mutable_proposal);
         dispatch_timelocked_action(&env, &proposal);
         TimelockEmergencyExec {
-            proposal_id, action: proposal.action,
-            executed_by: admin, executed_at: env.ledger().timestamp(),
-        }.publish(&env);
+            proposal_id,
+            action: proposal.action,
+            executed_by: admin,
+            executed_at: env.ledger().timestamp(),
+        }
+        .publish(&env);
     }
 
     pub fn get_timelock_proposal(env: Env, proposal_id: u32) -> Option<TimelockProposal> {
-        env.storage().persistent().get(&DataKey::Proposal(proposal_id))
+        env.storage()
+            .persistent()
+            .get(&DataKey::Proposal(proposal_id))
+    }
+
+    pub fn get_current_wasm_hash(env: Env) -> Option<BytesN<32>> {
+        env.storage().persistent().get(&DataKey::WasmHash)
     }
 
     pub fn get_timelock_proposal_count(env: Env) -> u32 {
-        env.storage().persistent().get(&DataKey::ProposalSeq).unwrap_or(0u32)
+        env.storage()
+            .persistent()
+            .get(&DataKey::ProposalSeq)
+            .unwrap_or(0u32)
+    }
+
+    /// Enumerate timelocked proposals across sequential IDs.
+    ///
+    /// - `cursor`: ID offset to start scanning from (e.g. 0 or 1 starts at first proposal).
+    ///   Proposals use 1-based sequential IDs. If `cursor == 0`, scanning begins at ID 1.
+    /// - `limit`: maximum number of proposals to return; capped at `MAX_TIMELOCK_PROPOSALS_PAGE`.
+    ///   If 0 or exceeding the cap, `limit` is clamped to `MAX_TIMELOCK_PROPOSALS_PAGE`.
+    /// - Non-existent/deleted proposals are skipped.
+    /// - Read-only query; no auth required.
+    pub fn list_timelock_proposals(
+        env: Env,
+        cursor: u32,
+        limit: u32,
+    ) -> TimelockProposalPage {
+        let effective_limit = if limit == 0 || limit > MAX_TIMELOCK_PROPOSALS_PAGE {
+            MAX_TIMELOCK_PROPOSALS_PAGE
+        } else {
+            limit
+        };
+
+        let total_seq: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ProposalSeq)
+            .unwrap_or(0u32);
+
+        let mut proposals = SorobanVec::new(&env);
+        let mut next_cursor: Option<u32> = None;
+
+        let mut id = if cursor == 0 { 1u32 } else { cursor };
+
+        while id <= total_seq {
+            if let Some(proposal) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, TimelockProposal>(&DataKey::Proposal(id))
+            {
+                proposals.push_back(proposal);
+                if proposals.len() == effective_limit {
+                    if id < total_seq {
+                        next_cursor = Some(id + 1);
+                    }
+                    break;
+                }
+            }
+            id = id.saturating_add(1);
+        }
+
+        TimelockProposalPage {
+            proposals,
+            next_cursor,
+        }
     }
 
     pub fn get_timelock_min_delay_secs(env: Env) -> u64 {
@@ -1500,10 +3718,375 @@ impl HarpocratesRegistry {
             panic_with_error!(&env, RegistryError::InvalidTimelockDelay);
         }
         let previous = get_timelock_min_delay(&env);
-        env.storage().persistent().set(&DataKey::TimelockMinDelay, &delay_secs);
+        env.storage()
+            .persistent()
+            .set(&DataKey::TimelockMinDelay, &delay_secs);
         TimelockMinDelaySet {
-            previous_delay: previous, new_delay: delay_secs, set_by: admin,
-        }.publish(&env);
+            previous_delay: previous,
+            new_delay: delay_secs,
+            set: Symbol::new(&env, "set"),
+            set_by: admin,
+        }
+        .publish(&env);
+    }
+
+    // -----------------------------------------------------------------------
+    // Admin Council Governance
+    // -----------------------------------------------------------------------
+
+    /// Configure an optional multi-party admin council guarded by current admin
+    /// and the timelock min delay.
+    pub fn set_admin_council(
+        env: Env,
+        admin: Address,
+        members: Vec<Address>,
+        threshold: u32,
+    ) {
+        require_admin(&env, &admin);
+
+        // If a council is currently active, changing it directly by single-admin is blocked.
+        if is_council_active(&env) {
+            panic_with_error!(&env, RegistryError::InsufficientApprovals);
+        }
+
+        if threshold == 0 || threshold > members.len() || members.len() > MAX_SIGNERS {
+            panic_with_error!(&env, RegistryError::InvalidProposalPayload);
+        }
+
+        // Distinct member enforcement (duplicate-signer rejection)
+        let len = members.len();
+        for i in 0..len {
+            for j in (i + 1)..len {
+                if members.get(i).unwrap() == members.get(j).unwrap() {
+                    panic_with_error!(&env, RegistryError::Unauthorized);
+                }
+            }
+        }
+
+        let now = env.ledger().timestamp();
+        let min_delay = get_timelock_min_delay(&env);
+        let effective_at = now.saturating_add(min_delay);
+
+        let council = AdminCouncil {
+            members: members.clone(),
+            threshold,
+            created_at: now,
+            effective_at,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::AdminCouncil, &council);
+
+        AdminCouncilSet {
+            threshold,
+            member_count: members.len(),
+            effective_at,
+        }
+        .publish(&env);
+    }
+
+    /// Return the active admin council, or None if no council is configured or still in timelock delay.
+    pub fn get_admin_council(env: Env) -> Option<AdminCouncil> {
+        let record = get_admin_council_record(&env)?;
+        if env.ledger().timestamp() >= record.effective_at {
+            Some(record)
+        } else {
+            None
+        }
+    }
+
+    /// Return the pending admin council currently in timelock delay, or None.
+    pub fn get_pending_admin_council(env: Env) -> Option<AdminCouncil> {
+        let record = get_admin_council_record(&env)?;
+        if env.ledger().timestamp() < record.effective_at {
+            Some(record)
+        } else {
+            None
+        }
+    }
+
+    /// Cancel a pending admin council before its timelock delay expires.
+    pub fn cancel_pending_admin_council(env: Env, admin: Address) {
+        require_admin(&env, &admin);
+        let record = get_admin_council_record(&env)
+            .unwrap_or_else(|| panic_with_error!(&env, RegistryError::AlreadyCancelled));
+        if env.ledger().timestamp() >= record.effective_at {
+            panic_with_error!(&env, RegistryError::AlreadyCancelled);
+        }
+        env.storage().persistent().remove(&DataKey::AdminCouncil);
+        AdminCouncilCancelled {
+            admin,
+            cancelled_at: env.ledger().timestamp(),
+        }
+        .publish(&env);
+    }
+
+    /// Propose a critical action to the active admin council.
+    pub fn propose_council_action(
+        env: Env,
+        proposer: Address,
+        action: u32,
+        target: Address,
+        payload: BytesN<32>,
+    ) -> u32 {
+        let council = Self::get_admin_council(env.clone())
+            .unwrap_or_else(|| panic_with_error!(&env, RegistryError::Unauthorized));
+
+        proposer.require_auth();
+
+        // Proposer must be a council member
+        let mut is_member = false;
+        for i in 0..council.members.len() {
+            if council.members.get(i).unwrap() == proposer {
+                is_member = true;
+                break;
+            }
+        }
+        if !is_member {
+            panic_with_error!(&env, RegistryError::Unauthorized);
+        }
+
+        if action == 0 || action > 7 {
+            panic_with_error!(&env, RegistryError::InvalidProposalAction);
+        }
+
+        let now = env.ledger().timestamp();
+        let proposal_id = next_council_proposal_id(&env);
+        let expires_at = now.saturating_add(DEFAULT_APPROVAL_TTL_SECS);
+
+        let proposal = CouncilProposal {
+            id: proposal_id,
+            action,
+            proposer: proposer.clone(),
+            target: target.clone(),
+            payload,
+            created_at: now,
+            expires_at,
+            approvals: SorobanVec::new(&env),
+            executed: false,
+            cancelled: false,
+        };
+
+        let intent = intent_digest(
+            &env,
+            COUNCIL_INTENT_DOMAIN,
+            proposal.action,
+            &proposal.target,
+            &proposal.payload,
+        );
+        env.storage()
+            .persistent()
+            .set(&DataKey::CouncilIntent(proposal_id), &intent);
+        env.storage()
+            .persistent()
+            .set(&DataKey::CouncilProposal(proposal_id), &proposal);
+
+        CouncilProposalCreated {
+            proposal_id,
+            action,
+            proposer,
+            target,
+            created_at: now,
+            expires_at,
+        }
+        .publish(&env);
+
+        proposal_id
+    }
+
+    /// Record a council member's approval for a proposal.
+    pub fn approve_council_proposal(env: Env, member: Address, proposal_id: u32) -> bool {
+        let council = Self::get_admin_council(env.clone())
+            .unwrap_or_else(|| panic_with_error!(&env, RegistryError::Unauthorized));
+
+        member.require_auth();
+
+        // Non-member rejection
+        let mut is_member = false;
+        for i in 0..council.members.len() {
+            if council.members.get(i).unwrap() == member {
+                is_member = true;
+                break;
+            }
+        }
+        if !is_member {
+            panic_with_error!(&env, RegistryError::Unauthorized);
+        }
+
+        let mut proposal = get_council_proposal_or_panic(&env, proposal_id);
+        if proposal.executed {
+            panic_with_error!(&env, RegistryError::ProposalAlreadyExecuted);
+        }
+        if proposal.cancelled {
+            panic_with_error!(&env, RegistryError::ProposalCancelled);
+        }
+        if env.ledger().timestamp() > proposal.expires_at {
+            panic_with_error!(&env, RegistryError::AlreadyExpired);
+        }
+
+        // Duplicate-signer rejection
+        for i in 0..proposal.approvals.len() {
+            if proposal.approvals.get(i).unwrap() == member {
+                panic_with_error!(&env, RegistryError::Unauthorized);
+            }
+        }
+
+        proposal.approvals.push_back(member.clone());
+        let count = proposal.approvals.len();
+        env.storage()
+            .persistent()
+            .set(&DataKey::CouncilProposal(proposal_id), &proposal);
+
+        CouncilProposalApproved {
+            proposal_id,
+            member,
+            approval_count: count,
+            threshold: council.threshold,
+        }
+        .publish(&env);
+
+        count >= council.threshold
+    }
+
+    /// Execute a council proposal once threshold distinct member approvals are gathered.
+    pub fn execute_council_proposal(env: Env, caller: Address, proposal_id: u32) {
+        let council = Self::get_admin_council(env.clone())
+            .unwrap_or_else(|| panic_with_error!(&env, RegistryError::Unauthorized));
+
+        caller.require_auth();
+
+        let mut proposal = get_council_proposal_or_panic(&env, proposal_id);
+        if proposal.executed {
+            panic_with_error!(&env, RegistryError::ProposalAlreadyExecuted);
+        }
+        if proposal.cancelled {
+            panic_with_error!(&env, RegistryError::ProposalCancelled);
+        }
+        if env.ledger().timestamp() > proposal.expires_at {
+            panic_with_error!(&env, RegistryError::AlreadyExpired);
+        }
+
+        // Threshold enforcement
+        if proposal.approvals.len() < council.threshold {
+            panic_with_error!(&env, RegistryError::InsufficientApprovals);
+        }
+
+        // Intent digest: bind execution to the approved parameters (#1184).
+        let stored_intent: BytesN<32> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CouncilIntent(proposal_id))
+            .unwrap_or_else(|| panic_with_error!(&env, RegistryError::MissingIntentDigest));
+        let recomputed = intent_digest(
+            &env,
+            COUNCIL_INTENT_DOMAIN,
+            proposal.action,
+            &proposal.target,
+            &proposal.payload,
+        );
+        if recomputed != stored_intent {
+            panic_with_error!(&env, RegistryError::IntentDigestMismatch);
+        }
+
+        proposal.executed = true;
+        env.storage()
+            .persistent()
+            .set(&DataKey::CouncilProposal(proposal_id), &proposal);
+
+        dispatch_council_action(&env, &proposal);
+
+        CouncilProposalExecuted {
+            proposal_id,
+            action: proposal.action,
+            executed_by: caller,
+            executed_at: env.ledger().timestamp(),
+        }
+        .publish(&env);
+    }
+
+    /// Cancel a council proposal using the compatibility reason code.
+    ///
+    /// New callers should use `cancel_council_proposal_reasoned`.
+    pub fn cancel_council_proposal(env: Env, caller: Address, proposal_id: u32) {
+        Self::cancel_council_proposal_internal(
+            env,
+            caller,
+            proposal_id,
+            CouncilCancellationReason::LegacyUnspecified,
+        );
+    }
+
+    /// Cancel a council proposal with a bounded, privacy-safe reason code.
+    pub fn cancel_council_proposal_reasoned(
+        env: Env,
+        caller: Address,
+        proposal_id: u32,
+        reason_code: CouncilCancellationReason,
+    ) {
+        Self::cancel_council_proposal_internal(env, caller, proposal_id, reason_code);
+    }
+
+    fn cancel_council_proposal_internal(
+        env: Env,
+        caller: Address,
+        proposal_id: u32,
+        reason_code: CouncilCancellationReason,
+    ) {
+        let council = Self::get_admin_council(env.clone())
+            .unwrap_or_else(|| panic_with_error!(&env, RegistryError::Unauthorized));
+
+        caller.require_auth();
+
+        let mut proposal = get_council_proposal_or_panic(&env, proposal_id);
+        if proposal.executed {
+            panic_with_error!(&env, RegistryError::ProposalAlreadyExecuted);
+        }
+        if proposal.cancelled {
+            panic_with_error!(&env, RegistryError::AlreadyCancelled);
+        }
+
+        // Caller must be proposer, admin, or a council member
+        let admin: Option<Address> = env.storage().persistent().get(&DataKey::Admin);
+        let is_admin = admin.as_ref() == Some(&caller);
+        let is_proposer = proposal.proposer == caller;
+        let mut is_member = false;
+        for i in 0..council.members.len() {
+            if council.members.get(i).unwrap() == caller {
+                is_member = true;
+                break;
+            }
+        }
+
+        if !is_admin && !is_proposer && !is_member {
+            panic_with_error!(&env, RegistryError::Unauthorized);
+        }
+
+        proposal.cancelled = true;
+        env.storage()
+            .persistent()
+            .set(&DataKey::CouncilProposal(proposal_id), &proposal);
+
+        CouncilProposalCancelled {
+            proposal_id,
+            cancelled_by: caller,
+            cancelled_at: env.ledger().timestamp(),
+            reason_code,
+        }
+        .publish(&env);
+    }
+
+    pub fn get_council_proposal(env: Env, proposal_id: u32) -> Option<CouncilProposal> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::CouncilProposal(proposal_id))
+    }
+
+    pub fn get_council_proposal_count(env: Env) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::CouncilProposalSeq)
+            .unwrap_or(0u32)
     }
 
     pub fn get_proof_status(env: Env, proof_id: BytesN<32>) -> ProofVerificationStatus {
@@ -1525,22 +4108,72 @@ impl HarpocratesRegistry {
         }
     }
 
+    /// Return status with the recorded first effective revocation ledger.
+    ///
+    /// Read-only. Legacy revocations have no recorded sequence and return
+    /// `None`; querying or repeating a revocation must never invent one.
+    pub fn get_proof_status_details(env: Env, proof_id: BytesN<32>) -> ProofStatusDetails {
+        let status = Self::get_proof_status(env.clone(), proof_id.clone());
+        let revoked_effective_ledger = if status == ProofVerificationStatus::Revoked {
+            env.storage()
+                .persistent()
+                .get(&DataKey::ProofRevocationLedger(proof_id))
+        } else {
+            None
+        };
+        ProofStatusDetails {
+            status,
+            revoked_effective_ledger,
+        }
+    }
+
     /// Return the human-readable verification status of multiple proofs in a single
     /// batch query, efficiently retrieving them without exceeding Soroban read budgets.
     ///
     /// The maximum number of proof IDs in a single batch is bounded (e.g. 100) to
     /// ensure the query always completes within resource limits.
-    pub fn get_proof_statuses(env: Env, proof_ids: SorobanVec<BytesN<32>>) -> SorobanVec<ProofVerificationStatus> {
+    pub fn get_proof_statuses(
+        env: Env,
+        proof_ids: soroban_sdk::Vec<BytesN<32>>,
+    ) -> soroban_sdk::Vec<ProofVerificationStatus> {
         let max_batch_size = 100;
         if proof_ids.len() > max_batch_size {
             panic_with_error!(&env, RegistryError::BatchTooLarge);
         }
-        
+
         let mut statuses = SorobanVec::new(&env);
         for proof_id in proof_ids.iter() {
             statuses.push_back(Self::get_proof_status(env.clone(), proof_id));
         }
         statuses
+    }
+
+    /// Single read call that summarises everything a verifier needs to trust a proof:
+    /// verification status, tier, timestamp assurance level, open dispute count,
+    /// metadata envelope version, and issuer verifiability.
+    ///
+    /// Returns `None` if the proof is not found.
+    pub fn get_proof_assurance(env: Env, proof_id: BytesN<32>) -> Option<ProofAssurance> {
+        let record: ProofRecord = env.storage().persistent().get(&DataKey::Proof(proof_id.clone()))?;
+        let status = Self::get_proof_status(env.clone(), proof_id.clone());
+        let timestamp_assurance_level = Self::get_timestamp_claim(env.clone(), proof_id.clone())
+            .map(|c| c.assurance)
+            .unwrap_or(TIMESTAMP_ASSURANCE_NONE);
+        let open_dispute_count = Self::get_open_dispute_count(env.clone(), proof_id.clone());
+        let envelope_version = Self::resolve_metadata_envelope_ver(env.clone(), proof_id.clone());
+        let issuer_verifiable = match record.issuer {
+            Some(issuer) => Self::is_issuer_verifiable(env.clone(), issuer),
+            None => false,
+        };
+
+        Some(ProofAssurance {
+            status,
+            tier: record.tier,
+            timestamp_assurance_level,
+            open_dispute_count,
+            envelope_version,
+            issuer_verifiable,
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -1553,6 +4186,12 @@ impl HarpocratesRegistry {
     /// under the previous epoch for that scope will have stale epoch values
     /// and will be rejected by `register_anonymous_verified`.
     ///
+    /// Epochs are strictly monotonic (`epoch > current`). Setting an epoch
+    /// less than or equal to the current epoch panics with `RegistryError::StaleEpoch`
+    /// to prevent epoch rollback and re-enabling previously consumed nullifiers.
+    /// Non-increasing transitions (including equal) are rejected rather than
+    /// treated idempotently to ensure every update explicitly advances the epoch.
+    ///
     /// The scope is a 32-byte identifier derived from the scope string
     /// (e.g., SHA-256 hash mod BN254 field).  An empty (zero) scope
     /// represents the global/unscoped context.
@@ -1560,6 +4199,12 @@ impl HarpocratesRegistry {
     /// Only the registry admin may call this.
     pub fn set_scope_epoch(env: Env, admin: Address, scope: BytesN<32>, epoch: u64) {
         require_admin(&env, &admin);
+
+        let current_epoch = get_scope_epoch_raw(&env, &scope);
+        if epoch <= current_epoch {
+            panic_with_error!(&env, RegistryError::StaleEpoch);
+        }
+
         env.storage()
             .persistent()
             .set(&DataKey::ScopeEpoch(scope.clone()), &epoch);
@@ -1591,11 +4236,8 @@ impl HarpocratesRegistry {
         require_domain_unpaused(&env, PAUSE_DOMAIN_TIER1_REGISTRATION);
         require_unique(&env, &proof_id, &video_hash);
 
-        if env
-            .storage()
-            .persistent()
-            .has(&DataKey::Nullifier(nullifier.clone()))
-        {
+        let verifier = get_active_verifier(&env);
+        if Self::has_nullifier(env.clone(), verifier.clone(), nullifier.clone()) {
             panic_with_error!(&env, RegistryError::DuplicateNullifier);
         }
 
@@ -1606,7 +4248,7 @@ impl HarpocratesRegistry {
 
         env.storage()
             .persistent()
-            .set(&DataKey::Nullifier(nullifier.clone()), &true);
+            .set(&DataKey::VerifierNullifier(verifier, nullifier.clone()), &true);
 
         let expires_at = compute_expires_at(&env);
         let record = ProofRecord {
@@ -1633,13 +4275,21 @@ impl HarpocratesRegistry {
         public_inputs: Bytes,
         proof: Bytes,
     ) -> ProofRecord {
+        let verifier_ctx = VerifierContext::load(&env);
         require_domain_unpaused(&env, PAUSE_DOMAIN_TIER1_REGISTRATION);
         require_unique(&env, &proof_id, &video_hash);
 
         let input_len = public_inputs.len();
 
-        let record = if input_len == SILENT_WITNESS_V2_INPUT_LEN {
-            // v2 scoped nullifier path
+        let record = if input_len == SILENT_WITNESS_V2_BARE_INPUT_LEN {
+            // The bare v2 frame predates #368 and commits no circuit version, so
+            // the verifier could only infer one from the length. Rejecting it by
+            // length here means a proof cannot dodge the version commitment by
+            // omitting the trailer.
+            panic_with_error!(&env, RegistryError::CircuitVersionMismatch);
+        } else if input_len == SILENT_WITNESS_V2_ENVELOPED_INPUT_LEN {
+            // v2 scoped nullifier path; the circuit-version envelope trailer is
+            // mandatory (#368).
             let parsed = parse_scoped_silent_witness_public_inputs(&env, &public_inputs);
             if parsed.video_hash != video_hash {
                 panic_with_error!(&env, RegistryError::InvalidPublicInputs);
@@ -1655,24 +4305,20 @@ impl HarpocratesRegistry {
                 panic_with_error!(&env, RegistryError::StaleEpoch);
             }
 
-            if env
-                .storage()
-                .persistent()
-                .has(&DataKey::Nullifier(parsed.nullifier.clone()))
-            {
+            let verifier = verifier_ctx.verifier(&env);
+            if verifier_ctx.has_nullifier(&env, &parsed.nullifier) {
                 panic_with_error!(&env, RegistryError::DuplicateNullifier);
             }
-
-            let verifier: Address = env
-                .storage()
-                .persistent()
-                .get(&DataKey::Verifier)
-                .unwrap_or_else(|| panic_with_error!(&env, RegistryError::VerifierNotSet));
-            verify_external_proof(&env, &verifier, public_inputs, proof);
+            verifier_ctx.require_verified_proof(
+                &env,
+                CIRCUIT_VERSION_SILENT_WITNESS_V2,
+                public_inputs,
+                proof,
+            );
 
             env.storage()
                 .persistent()
-                .set(&DataKey::Nullifier(parsed.nullifier.clone()), &true);
+                .set(&DataKey::VerifierNullifier(verifier.clone(), parsed.nullifier.clone()), &true);
 
             let expires_at = compute_expires_at(&env);
             save_record(
@@ -1703,24 +4349,63 @@ impl HarpocratesRegistry {
             }
             require_active_credential_root(&env, &parsed.credential_root);
 
-            if env
-                .storage()
-                .persistent()
-                .has(&DataKey::Nullifier(parsed.nullifier.clone()))
-            {
+            let verifier = verifier_ctx.verifier(&env);
+            if verifier_ctx.has_nullifier(&env, &parsed.nullifier) {
                 panic_with_error!(&env, RegistryError::DuplicateNullifier);
             }
+            verifier_ctx.require_verified_proof(
+                &env,
+                CIRCUIT_VERSION_SILENT_WITNESS_V1,
+                public_inputs,
+                proof,
+            );
+
+            env.storage()
+                .persistent()
+                .set(&DataKey::VerifierNullifier(verifier.clone(), parsed.nullifier.clone()), &true);
+
+            let expires_at = compute_expires_at(&env);
+            save_record(
+                &env,
+                &proof_id,
+                ProofRecord {
+                    video_hash,
+                    metadata_hash,
+                    tier: TIER_SILENT_WITNESS,
+                    status: STATUS_REGISTERED,
+                    created_at: env.ledger().timestamp(),
+                    expires_at,
+                    source: None,
+                    issuer: None,
+                    nullifier: Some(parsed.nullifier),
+                    batch_size: 0,
+                },
+                None,
+            )
+        } else if input_len == SILENT_WITNESS_BROWSER_V1_INPUT_LEN {
+            // v1 browser artifact path (4 x 32 = 128 bytes, shipped in frontend/public/noir)
+            let parsed = parse_browser_silent_witness_public_inputs(&env, &public_inputs);
+            if parsed.video_hash != video_hash {
+                panic_with_error!(&env, RegistryError::InvalidPublicInputs);
+            }
+            require_active_credential_root(&env, &parsed.credential_root);
 
             let verifier: Address = env
                 .storage()
                 .persistent()
                 .get(&DataKey::Verifier)
                 .unwrap_or_else(|| panic_with_error!(&env, RegistryError::VerifierNotSet));
-            verify_external_proof(&env, &verifier, public_inputs, proof);
+            require_verified_proof(
+                &env,
+                &verifier,
+                CIRCUIT_VERSION_SILENT_WITNESS_V1,
+                public_inputs,
+                proof,
+            );
 
             env.storage()
                 .persistent()
-                .set(&DataKey::Nullifier(parsed.nullifier.clone()), &true);
+                .set(&DataKey::VerifierNullifier(verifier, parsed.nullifier.clone()), &true);
 
             let expires_at = compute_expires_at(&env);
             save_record(
@@ -1786,8 +4471,9 @@ impl HarpocratesRegistry {
         metadata_hash: BytesN<32>,
         public_inputs: Bytes,
         proof: Bytes,
-        video_hashes: SorobanVec<BytesN<32>>,
-    ) -> SorobanVec<ProofRecord> {
+        video_hashes: soroban_sdk::Vec<BytesN<32>>,
+    ) -> soroban_sdk::Vec<ProofRecord> {
+        let verifier_ctx = VerifierContext::load(&env);
         let batch_size = video_hashes.len();
 
         if batch_size == 0 || batch_size > MAX_AGGREGATION_SIZE {
@@ -1805,13 +4491,15 @@ impl HarpocratesRegistry {
         }
 
         // 2. Verify the aggregated UltraHonk proof through the configured
-        //    verifier contract.
-        let verifier: Address = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Verifier)
-            .unwrap_or_else(|| panic_with_error!(&env, RegistryError::VerifierNotSet));
-        verify_external_proof(&env, &verifier, public_inputs, proof);
+        //    verifier contract, validating the aggregation circuit version at
+        //    the trust boundary first.
+        let verifier = verifier_ctx.verifier(&env);
+        verifier_ctx.require_verified_proof(
+            &env,
+            CIRCUIT_VERSION_AGGREGATION,
+            public_inputs,
+            proof,
+        );
 
         // 3. Credential root must be registered and active.
         let shared_root = &parsed.elements[0].credential_root;
@@ -1861,11 +4549,7 @@ impl HarpocratesRegistry {
             }
 
             // Check nullifier uniqueness.
-            if env
-                .storage()
-                .persistent()
-                .has(&DataKey::Nullifier(element.nullifier.clone()))
-            {
+            if verifier_ctx.has_nullifier(&env, &element.nullifier) {
                 panic_with_error!(&env, RegistryError::DuplicateNullifier);
             }
         }
@@ -1879,7 +4563,7 @@ impl HarpocratesRegistry {
             // Consume the nullifier.
             env.storage()
                 .persistent()
-                .set(&DataKey::Nullifier(element.nullifier.clone()), &true);
+                .set(&DataKey::VerifierNullifier(verifier.clone(), element.nullifier.clone()), &true);
 
             let record = save_record(
                 &env,
@@ -1904,6 +4588,7 @@ impl HarpocratesRegistry {
 
         // Emit a top-level batch event.
         BatchProofRegistered {
+            reg: Symbol::new(&env, "reg"),
             batch_id,
             credential_root: shared_root.clone(),
             count: batch_size,
@@ -1922,9 +4607,11 @@ impl HarpocratesRegistry {
         metadata_hash: BytesN<32>,
         proof_id: BytesN<32>,
     ) -> ProofRecord {
+        require_initialized(&env);
         require_domain_unpaused(&env, PAUSE_DOMAIN_TIER2_REGISTRATION);
         source.require_auth();
         require_unique(&env, &proof_id, &video_hash);
+        charge_issuer_quota(&env, &source);
 
         let expires_at = compute_expires_at(&env);
         let record = ProofRecord {
@@ -1943,6 +4630,118 @@ impl HarpocratesRegistry {
         record
     }
 
+    /// Register a Tier 2 source batch root.
+    ///
+    /// Allows high-volume Tier 2 sources to anchor many items in a single transaction
+    /// by committing the root of a binary Merkle tree.
+    pub fn register_source_batch_root(
+        env: Env,
+        source: Address,
+        root: BytesN<32>,
+        count: u32,
+        metadata_hash: BytesN<32>,
+    ) -> BatchRecord {
+        require_initialized(&env);
+        require_domain_unpaused(&env, PAUSE_DOMAIN_TIER2_REGISTRATION);
+        source.require_auth();
+
+        if count < MIN_SOURCE_BATCH_COUNT || count > MAX_SOURCE_BATCH_COUNT {
+            panic_with_error!(&env, RegistryError::BatchSizeExceeded);
+        }
+
+        if env.storage().persistent().has(&DataKey::SourceBatch(root.clone())) {
+            panic_with_error!(&env, RegistryError::DuplicateProof);
+        }
+
+        let created_at = env.ledger().timestamp();
+        let record = BatchRecord {
+            root: root.clone(),
+            source: source.clone(),
+            count,
+            metadata_hash: metadata_hash.clone(),
+            created_at,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::SourceBatch(root.clone()), &record);
+
+        SourceBatchRootRegistered {
+            root,
+            source,
+            count,
+            metadata_hash,
+            registered_at: created_at,
+        }
+        .publish(&env);
+
+        record
+    }
+
+    /// Verify cryptographic inclusion of a leaf in a source batch root.
+    ///
+    /// Evaluates a binary Merkle inclusion proof using SHA-256 with domain-separated
+    /// leaf (`0x00`) and node (`0x01`) hashing to prevent second-preimage attacks
+    /// by construction.
+    pub fn verify_source_batch_inclusion(
+        env: Env,
+        root: BytesN<32>,
+        leaf: BytesN<32>,
+        proof: Vec<BytesN<32>>,
+        index: u32,
+    ) -> bool {
+        let proof_len = proof.len();
+        if proof_len > MAX_SOURCE_BATCH_PROOF_LEN {
+            panic_with_error!(&env, RegistryError::InvalidInclusionProof);
+        }
+
+        if proof_len < 32 {
+            let max_capacity = 1u64 << proof_len;
+            if (index as u64) >= max_capacity {
+                panic_with_error!(&env, RegistryError::InvalidInclusionProof);
+            }
+        }
+
+        // Domain-separated leaf hashing: SHA-256(0x00 || leaf)
+        let mut leaf_preimage = Bytes::new(&env);
+        leaf_preimage.push_back(SOURCE_BATCH_LEAF_DOMAIN);
+        leaf_preimage.extend_from_slice(&leaf.to_array());
+        let mut current: BytesN<32> = env.crypto().sha256(&leaf_preimage).into();
+
+        // Walk up the Merkle path
+        for i in 0..proof_len {
+            let sibling = proof.get(i).unwrap();
+            let bit = (index >> i) & 1;
+
+            let mut node_preimage = Bytes::new(&env);
+            node_preimage.push_back(SOURCE_BATCH_NODE_DOMAIN);
+            if bit == 0 {
+                // current is left, sibling is right
+                node_preimage.extend_from_slice(&current.to_array());
+                node_preimage.extend_from_slice(&sibling.to_array());
+            } else {
+                // sibling is left, current is right
+                node_preimage.extend_from_slice(&sibling.to_array());
+                node_preimage.extend_from_slice(&current.to_array());
+            }
+
+            current = env.crypto().sha256(&node_preimage).into();
+        }
+
+        if current != root {
+            panic_with_error!(&env, RegistryError::InvalidInclusionProof);
+        }
+
+        true
+    }
+
+    /// Read-only query for a stored source batch record.
+    pub fn get_source_batch(env: Env, root: BytesN<32>) -> Option<BatchRecord> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::SourceBatch(root))
+    }
+
     pub fn register_seal(
         env: Env,
         issuer: Address,
@@ -1952,12 +4751,14 @@ impl HarpocratesRegistry {
     ) -> ProofRecord {
         require_domain_unpaused(&env, PAUSE_DOMAIN_TIER3_REGISTRATION);
         issuer.require_auth();
+        require_issuer_role_available(&env, &issuer);
         require_unique(&env, &proof_id, &video_hash);
 
         let issuer_record = get_issuer_record(&env, &issuer);
         if !issuer_record.active {
             panic_with_error!(&env, RegistryError::UnknownIssuer);
         }
+        charge_issuer_quota(&env, &issuer);
 
         let expires_at = compute_expires_at(&env);
         let record = ProofRecord {
@@ -2007,6 +4808,7 @@ impl HarpocratesRegistry {
         scope: u32,
         duration_secs: u64,
     ) -> u64 {
+        require_initialized(&env);
         grantor.require_auth();
 
         if grantor == delegate {
@@ -2063,6 +4865,7 @@ impl HarpocratesRegistry {
     /// delegation that does not exist is a no-op rather than an error, so
     /// retries and concurrent revocations converge.
     pub fn revoke_delegation(env: Env, revoker: Address, grantor: Address, delegate: Address) {
+        require_initialized(&env);
         revoker.require_auth();
 
         if revoker != grantor {
@@ -2117,12 +4920,7 @@ impl HarpocratesRegistry {
     /// every bit of `scope`? Returns `false` for unknown, expired, or
     /// insufficiently scoped delegations rather than erroring, so callers can
     /// pre-flight without a trial transaction.
-    pub fn is_delegation_active(
-        env: Env,
-        grantor: Address,
-        delegate: Address,
-        scope: u32,
-    ) -> bool {
+    pub fn is_delegation_active(env: Env, grantor: Address, delegate: Address, scope: u32) -> bool {
         if scope == 0 || scope & !DELEGATION_SCOPE_ALL != 0 {
             return false;
         }
@@ -2163,10 +4961,14 @@ impl HarpocratesRegistry {
     ) -> ProofRecord {
         require_domain_unpaused(&env, PAUSE_DOMAIN_TIER2_REGISTRATION);
         delegate.require_auth();
-        require_delegation(&env, &source, &delegate, DELEGATION_SCOPE_REGISTER_SOURCE);
+        let delegation =
+            require_delegation(&env, &source, &delegate, DELEGATION_SCOPE_REGISTER_SOURCE);
         require_unique(&env, &proof_id, &video_hash);
+        // The quota is the source's, not the delegate's: delegation is
+        // exercised authority, so the attributed key pays for it (#806).
+        charge_issuer_quota(&env, &source);
 
-        let expires_at = compute_expires_at(&env);
+        let expires_at = bounded_delegated_expiry(&env, delegation.expires_at);
         let record = ProofRecord {
             video_hash,
             metadata_hash,
@@ -2206,15 +5008,19 @@ impl HarpocratesRegistry {
     ) -> ProofRecord {
         require_domain_unpaused(&env, PAUSE_DOMAIN_TIER3_REGISTRATION);
         delegate.require_auth();
-        require_delegation(&env, &issuer, &delegate, DELEGATION_SCOPE_REGISTER_SEAL);
+        let delegation =
+            require_delegation(&env, &issuer, &delegate, DELEGATION_SCOPE_REGISTER_SEAL);
         require_unique(&env, &proof_id, &video_hash);
 
         let issuer_record = get_issuer_record(&env, &issuer);
         if !issuer_record.active {
             panic_with_error!(&env, RegistryError::UnknownIssuer);
         }
+        // The quota is the issuer's, not the delegate's: a delegate exercises
+        // the issuer's standing, so the issuer pays for it (#806).
+        charge_issuer_quota(&env, &issuer);
 
-        let expires_at = compute_expires_at(&env);
+        let expires_at = bounded_delegated_expiry(&env, delegation.expires_at);
         let record = ProofRecord {
             video_hash,
             metadata_hash,
@@ -2238,10 +5044,381 @@ impl HarpocratesRegistry {
         record
     }
 
-    pub fn revoke_proof(env: Env, admin: Address, proof_id: BytesN<32>) {
-        require_admin(&env, &admin);
+    /// Read-only preflight for Tier 1 (Silent Witness) statement registration (#1199).
+    ///
+    /// Evaluates canonical public-field framing and current on-chain registry policy
+    /// without storing a proof, invoking an external verifier, requiring authorization,
+    /// or mutating storage.
+    ///
+    /// Separation of concerns:
+    /// - `preflight_accepted == true` means public field structure and active
+    ///   on-chain policy accept the candidate statement at the current ledger.
+    /// - `cryptographically_verified` is **always `false`**, `proof_stored` is
+    ///   **always `false`**, `requires_crypto_verify` is **always `true`**, and
+    ///   `stage` is [`PreflightStage::StructureAndPolicyOnly`], so callers can
+    ///   never confuse preflight acceptance with cryptographic proof verification
+    ///   or persistent registration.
+    pub fn preflight_statement(
+        env: Env,
+        video_hash: BytesN<32>,
+        metadata_hash: BytesN<32>,
+        envelope_version: u32,
+        proof_id: BytesN<32>,
+        public_inputs: Bytes,
+        proof_len: u32,
+    ) -> StatementPreflightResult {
+        if !env.storage().persistent().has(&DataKey::Admin) {
+            return preflight_reject(
+                TIER_SILENT_WITNESS,
+                0,
+                envelope_version,
+                RegistryError::NotInitialized as u32,
+                verifier_inputs::ACCEPTED_CODE,
+            );
+        }
 
-        let mut record = get_proof_record(&env, &proof_id);
+        if domain_is_paused(
+            &env,
+            PAUSE_DOMAIN_TIER1_REGISTRATION,
+            env.ledger().timestamp(),
+        ) {
+            return preflight_reject(
+                TIER_SILENT_WITNESS,
+                0,
+                envelope_version,
+                RegistryError::Paused as u32,
+                verifier_inputs::ACCEPTED_CODE,
+            );
+        }
+
+        if let Err(err) = check_preflight_envelope(&env, envelope_version, &metadata_hash) {
+            return preflight_reject(
+                TIER_SILENT_WITNESS,
+                0,
+                envelope_version,
+                err as u32,
+                verifier_inputs::ACCEPTED_CODE,
+            );
+        }
+
+        if let Err(err) = check_preflight_unique(&env, &proof_id, &video_hash) {
+            return preflight_reject(
+                TIER_SILENT_WITNESS,
+                0,
+                envelope_version,
+                err as u32,
+                verifier_inputs::ACCEPTED_CODE,
+            );
+        }
+
+        let input_len = public_inputs.len();
+        if input_len == SILENT_WITNESS_V2_BARE_INPUT_LEN {
+            return preflight_reject(
+                TIER_SILENT_WITNESS,
+                0,
+                envelope_version,
+                RegistryError::CircuitVersionMismatch as u32,
+                verifier_inputs::RejectCode::Length.as_code(),
+            );
+        }
+
+        let expected_domain = expected_domain_tag(&env).to_array();
+        let mut raw_inputs = [0u8; 512];
+        if input_len as usize > raw_inputs.len() {
+            return preflight_reject(
+                TIER_SILENT_WITNESS,
+                0,
+                envelope_version,
+                RegistryError::InvalidPublicInputs as u32,
+                verifier_inputs::RejectCode::Length.as_code(),
+            );
+        }
+        let input_len_usize = input_len as usize;
+        public_inputs.copy_into_slice(&mut raw_inputs[..input_len_usize]);
+        let input_slice = &raw_inputs[..input_len_usize];
+
+        let (parsed_video_hash, parsed_cred_root, parsed_nullifier, circuit_version) =
+            if input_len == verifier_inputs::SILENT_WITNESS_BROWSER_PUBLIC_INPUTS_LEN as u32 {
+                match verifier_inputs::parse_browser_silent_witness(input_slice) {
+                    Ok(parsed) => (
+                        parsed.video_hash,
+                        parsed.credential_root,
+                        parsed.nullifier,
+                        parsed.circuit_version,
+                    ),
+                    Err(code) => {
+                        return preflight_reject(
+                            TIER_SILENT_WITNESS,
+                            1,
+                            envelope_version,
+                            map_codec_reject_to_registry_error(code) as u32,
+                            code.as_code(),
+                        );
+                    }
+                }
+            } else if input_len == verifier_inputs::SILENT_WITNESS_V2_PUBLIC_INPUTS_LEN as u32 {
+                match verifier_inputs::parse_silent_witness_v2(input_slice, &expected_domain) {
+                    Ok(parsed) => {
+                        let parsed_scope = BytesN::from_array(&env, &parsed.verifier_scope);
+                        let epoch_val = bytes_to_u64_be(&parsed.epoch);
+                        let current_epoch = get_scope_epoch_raw(&env, &parsed_scope);
+                        if epoch_val != current_epoch {
+                            return preflight_reject(
+                                TIER_SILENT_WITNESS,
+                                parsed.circuit_version,
+                                envelope_version,
+                                RegistryError::StaleEpoch as u32,
+                                verifier_inputs::ACCEPTED_CODE,
+                            );
+                        }
+                        (
+                            parsed.video_hash,
+                            parsed.credential_root,
+                            parsed.nullifier,
+                            parsed.circuit_version,
+                        )
+                    }
+                    Err(code) => {
+                        return preflight_reject(
+                            TIER_SILENT_WITNESS,
+                            2,
+                            envelope_version,
+                            map_codec_reject_to_registry_error(code) as u32,
+                            code.as_code(),
+                        );
+                    }
+                }
+            } else if input_len == verifier_inputs::SILENT_WITNESS_PUBLIC_INPUTS_LEN as u32 {
+                match verifier_inputs::parse_silent_witness(input_slice, &expected_domain) {
+                    Ok(parsed) => (
+                        parsed.video_hash,
+                        parsed.credential_root,
+                        parsed.nullifier,
+                        parsed.circuit_version,
+                    ),
+                    Err(code) => {
+                        return preflight_reject(
+                            TIER_SILENT_WITNESS,
+                            1,
+                            envelope_version,
+                            map_codec_reject_to_registry_error(code) as u32,
+                            code.as_code(),
+                        );
+                    }
+                }
+            } else {
+                return preflight_reject(
+                    TIER_SILENT_WITNESS,
+                    0,
+                    envelope_version,
+                    RegistryError::InvalidPublicInputs as u32,
+                    verifier_inputs::RejectCode::Length.as_code(),
+                );
+            };
+
+        let parsed_video = BytesN::from_array(&env, &parsed_video_hash);
+        if parsed_video != video_hash {
+            return preflight_reject(
+                TIER_SILENT_WITNESS,
+                circuit_version,
+                envelope_version,
+                RegistryError::InvalidPublicInputs as u32,
+                verifier_inputs::ACCEPTED_CODE,
+            );
+        }
+
+        let parsed_root = BytesN::from_array(&env, &parsed_cred_root);
+        if let Err(err) = check_active_credential_root(&env, &parsed_root) {
+            return preflight_reject(
+                TIER_SILENT_WITNESS,
+                circuit_version,
+                envelope_version,
+                err as u32,
+                verifier_inputs::ACCEPTED_CODE,
+            );
+        }
+
+        let verifier_ctx = VerifierContext::load(&env);
+        let Some(_verifier) = verifier_ctx.verifier.as_ref() else {
+            return preflight_reject(
+                TIER_SILENT_WITNESS,
+                circuit_version,
+                envelope_version,
+                RegistryError::VerifierNotSet as u32,
+                verifier_inputs::ACCEPTED_CODE,
+            );
+        };
+
+        if let Err(err) = check_supported_circuit_version(&verifier_ctx, circuit_version) {
+            return preflight_reject(
+                TIER_SILENT_WITNESS,
+                circuit_version,
+                envelope_version,
+                err as u32,
+                verifier_inputs::ACCEPTED_CODE,
+            );
+        }
+
+        let parsed_null = BytesN::from_array(&env, &parsed_nullifier);
+        if verifier_ctx.has_nullifier(&env, &parsed_null) {
+            return preflight_reject(
+                TIER_SILENT_WITNESS,
+                circuit_version,
+                envelope_version,
+                RegistryError::DuplicateNullifier as u32,
+                verifier_inputs::ACCEPTED_CODE,
+            );
+        }
+
+        if let Err(code) = verifier_inputs::check_proof_bounds(proof_len) {
+            return preflight_reject(
+                TIER_SILENT_WITNESS,
+                circuit_version,
+                envelope_version,
+                RegistryError::InvalidProof as u32,
+                code.as_code(),
+            );
+        }
+
+        preflight_accept(TIER_SILENT_WITNESS, circuit_version, envelope_version)
+    }
+
+    /// Read-only preflight for a Tier 2 (Consistent Source) or Tier 3 (Public
+    /// Seal) statement registration (#1199).
+    ///
+    /// Validates tier selection (`2` or `3`), initialization, per-tier pause
+    /// domains, metadata envelope version, role conflict, statement uniqueness,
+    /// issuer standing, and caller quota availability without requiring account
+    /// signature authorization, storing proof records, or mutating quota counters.
+    ///
+    /// Separation of concerns: `cryptographically_verified` and `proof_stored`
+    /// are always `false` and `requires_crypto_verify` is always `true` because
+    /// account signature authorization (`require_auth`) is enforced only on the
+    /// actual `register_source` / `register_seal` write transaction.
+    pub fn preflight_tier_statement(
+        env: Env,
+        tier: u32,
+        actor: Address,
+        video_hash: BytesN<32>,
+        metadata_hash: BytesN<32>,
+        envelope_version: u32,
+        proof_id: BytesN<32>,
+    ) -> StatementPreflightResult {
+        if tier != TIER_CONSISTENT_SOURCE && tier != TIER_PUBLIC_SEAL {
+            return preflight_reject(
+                tier,
+                0,
+                envelope_version,
+                RegistryError::InvalidPublicInputs as u32,
+                verifier_inputs::ACCEPTED_CODE,
+            );
+        }
+
+        let Some(admin) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Address>(&DataKey::Admin)
+        else {
+            return preflight_reject(
+                tier,
+                0,
+                envelope_version,
+                RegistryError::NotInitialized as u32,
+                verifier_inputs::ACCEPTED_CODE,
+            );
+        };
+
+        let pause_domain = if tier == TIER_CONSISTENT_SOURCE {
+            PAUSE_DOMAIN_TIER2_REGISTRATION
+        } else {
+            PAUSE_DOMAIN_TIER3_REGISTRATION
+        };
+        if domain_is_paused(&env, pause_domain, env.ledger().timestamp()) {
+            return preflight_reject(
+                tier,
+                0,
+                envelope_version,
+                RegistryError::Paused as u32,
+                verifier_inputs::ACCEPTED_CODE,
+            );
+        }
+
+        if let Err(err) = check_preflight_envelope(&env, envelope_version, &metadata_hash) {
+            return preflight_reject(
+                tier,
+                0,
+                envelope_version,
+                err as u32,
+                verifier_inputs::ACCEPTED_CODE,
+            );
+        }
+
+        if tier == TIER_PUBLIC_SEAL && actor == admin {
+            return preflight_reject(
+                tier,
+                0,
+                envelope_version,
+                RegistryError::RoleConflict as u32,
+                verifier_inputs::ACCEPTED_CODE,
+            );
+        }
+
+        if let Err(err) = check_preflight_unique(&env, &proof_id, &video_hash) {
+            return preflight_reject(
+                tier,
+                0,
+                envelope_version,
+                err as u32,
+                verifier_inputs::ACCEPTED_CODE,
+            );
+        }
+
+        if tier == TIER_PUBLIC_SEAL {
+            let active_issuer = env
+                .storage()
+                .persistent()
+                .get::<DataKey, IssuerRecord>(&DataKey::Issuer(actor.clone()))
+                .map(|r| r.active)
+                .unwrap_or(false);
+            if !active_issuer {
+                return preflight_reject(
+                    tier,
+                    0,
+                    envelope_version,
+                    RegistryError::UnknownIssuer as u32,
+                    verifier_inputs::ACCEPTED_CODE,
+                );
+            }
+        }
+
+        if let Err(err) = check_issuer_quota_available(&env, &actor) {
+            return preflight_reject(
+                tier,
+                0,
+                envelope_version,
+                err as u32,
+                verifier_inputs::ACCEPTED_CODE,
+            );
+        }
+
+        preflight_accept(tier, 0, envelope_version)
+    }
+
+    fn revoke_proof_internal(
+        env: &Env,
+        admin: &Address,
+        proof_id: &BytesN<32>,
+        reason_code: u32,
+    ) {
+        let mut record = get_proof_record(env, proof_id);
+        // Only the first transition has a known effective ledger. In particular,
+        // do not backfill legacy revocations from the ledger of a later retry.
+        if record.status != STATUS_REVOKED {
+            env.storage().persistent().set(
+                &DataKey::ProofRevocationLedger(proof_id.clone()),
+                &env.ledger().sequence(),
+            );
+        }
         record.status = STATUS_REVOKED;
         env.storage()
             .persistent()
@@ -2250,14 +5427,45 @@ impl HarpocratesRegistry {
             proof_id: proof_id.clone(),
             status: STATUS_REVOKED,
         }
-        .publish(&env);
+        .publish(env);
         record_proof_history(
-            &env,
-            &proof_id,
+            env,
+            proof_id,
             ProofLifecycleAction::Revoked as u32,
-            Some(admin),
-            1,
+            Some(admin.clone()),
+            reason_code,
         );
+    }
+
+    pub fn revoke_proof(env: Env, admin: Address, proof_id: BytesN<32>) {
+        require_admin(&env, &admin);
+        Self::revoke_proof_internal(&env, &admin, &proof_id, 1);
+    }
+
+    /// Revoke multiple proofs in a single transaction during incident response.
+    ///
+    /// Reuses the single-revoke path so history entries and events are identical per proof.
+    /// Bounded by [`MAX_REVOKE_PROOFS_BATCH_SIZE`] against the execution budget.
+    /// Fails atomically on any invalid proof.
+    pub fn revoke_proofs(
+        env: Env,
+        admin: Address,
+        proof_ids: soroban_sdk::Vec<BytesN<32>>,
+        reason_code: u32,
+    ) {
+        require_admin(&env, &admin);
+
+        if proof_ids.len() > MAX_REVOKE_PROOFS_BATCH_SIZE {
+            panic_with_error!(&env, RegistryError::BatchTooLarge);
+        }
+
+        if reason_code > 255 {
+            panic_with_error!(&env, RegistryError::InvalidReasonCode);
+        }
+
+        for proof_id in proof_ids.iter() {
+            Self::revoke_proof_internal(&env, &admin, &proof_id, reason_code);
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -2374,6 +5582,191 @@ impl HarpocratesRegistry {
             .unwrap_or(0)
     }
 
+    pub fn get_proof_history(
+        env: Env,
+        proof_id: BytesN<32>,
+        offset: u32,
+        limit: u32,
+    ) -> SorobanVec<ProofHistoryEntry> {
+        if limit == 0 || limit > MAX_HISTORY_LIMIT {
+            panic_with_error!(&env, RegistryError::HistoryLimitExceeded);
+        }
+
+        let total: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ProofHistorySeq(proof_id.clone()))
+            .unwrap_or(0);
+
+        let mut entries = SorobanVec::new(&env);
+        if offset >= total {
+            return entries;
+        }
+
+        let end = offset.saturating_add(limit).min(total);
+        for seq in (offset + 1)..=end {
+            if let Some(entry) = env
+                .storage()
+                .persistent()
+                .get::<_, ProofHistoryEntry>(&DataKey::ProofHistoryEntry(proof_id.clone(), seq))
+            {
+                entries.push_back(entry);
+            }
+        }
+
+        entries
+    }
+
+    /// Return a bounded, paginated slice of the global institutional authority transition history.
+    pub fn get_institutional_authority_history(
+        env: Env,
+        offset: u32,
+        limit: u32,
+    ) -> AuthorityHistoryPage {
+        if limit == 0 || limit > MAX_AUTHORITY_HISTORY_PAGE {
+            panic_with_error!(&env, RegistryError::HistoryLimitExceeded);
+        }
+
+        let total: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AuthorityHistorySeq)
+            .unwrap_or(0);
+
+        let mut entries = SorobanVec::new(&env);
+        if offset >= total {
+            return AuthorityHistoryPage {
+                entries,
+                next_offset: offset,
+                next_cursor: None,
+                total,
+            };
+        }
+
+        let end = offset.saturating_add(limit).min(total);
+        for seq in (offset + 1)..=end {
+            if let Some(entry) = env
+                .storage()
+                .persistent()
+                .get::<_, AuthorityHistoryEntry>(&DataKey::AuthorityHistoryEntry(seq))
+            {
+                entries.push_back(entry);
+            }
+        }
+
+        let next_offset = end;
+        let next_cursor = if next_offset < total {
+            Some(next_offset)
+        } else {
+            None
+        };
+
+        AuthorityHistoryPage {
+            entries,
+            next_offset,
+            next_cursor,
+            total,
+        }
+    }
+
+    /// Return a bounded, paginated slice of the global institutional authority transition history.
+    /// Alias for `get_institutional_authority_history`.
+    pub fn get_authority_history(
+        env: Env,
+        offset: u32,
+        limit: u32,
+    ) -> AuthorityHistoryPage {
+        Self::get_institutional_authority_history(env, offset, limit)
+    }
+
+    /// Return a bounded, paginated slice of authority transitions for a specific historical approver.
+    pub fn get_approver_authority_history(
+        env: Env,
+        approver: Address,
+        offset: u32,
+        limit: u32,
+    ) -> AuthorityHistoryPage {
+        if limit == 0 || limit > MAX_AUTHORITY_HISTORY_PAGE {
+            panic_with_error!(&env, RegistryError::HistoryLimitExceeded);
+        }
+
+        let total: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ApproverAuthorityHistorySeq(approver.clone()))
+            .unwrap_or(0);
+
+        let mut entries = SorobanVec::new(&env);
+        if offset >= total {
+            return AuthorityHistoryPage {
+                entries,
+                next_offset: offset,
+                next_cursor: None,
+                total,
+            };
+        }
+
+        let end = offset.saturating_add(limit).min(total);
+        for seq in (offset + 1)..=end {
+            if let Some(entry) = env
+                .storage()
+                .persistent()
+                .get::<_, AuthorityHistoryEntry>(&DataKey::ApproverAuthorityHistoryEntry(approver.clone(), seq))
+            {
+                entries.push_back(entry);
+            }
+        }
+
+        let next_offset = end;
+        let next_cursor = if next_offset < total {
+            Some(next_offset)
+        } else {
+            None
+        };
+
+        AuthorityHistoryPage {
+            entries,
+            next_offset,
+            next_cursor,
+            total,
+        }
+    }
+
+    /// Look up a specific authority history transition by its 1-based sequential reference.
+    pub fn get_authority_history_at(
+        env: Env,
+        reference: u32,
+    ) -> Option<AuthorityHistoryEntry> {
+        let total: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AuthorityHistorySeq)
+            .unwrap_or(0);
+
+        if reference == 0 || reference > total {
+            return None;
+        }
+
+        env.storage()
+            .persistent()
+            .get(&DataKey::AuthorityHistoryEntry(reference))
+    }
+
+    /// Return the total count of recorded global institutional authority transitions.
+    pub fn get_authority_history_count(env: Env) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::AuthorityHistorySeq)
+            .unwrap_or(0)
+    }
+
+    /// Return the total count of authority transitions for a given historical approver.
+    pub fn get_approver_authority_history_count(env: Env, approver: Address) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ApproverAuthorityHistorySeq(approver))
+            .unwrap_or(0)
+    }
 
     // -----------------------------------------------------------------------
     // On-chain metadata envelope versioning (#317)
@@ -2447,6 +5840,7 @@ impl HarpocratesRegistry {
         if let Some(prev) = previous {
             if version > prev.version {
                 MetadataEnvelopeUpgraded {
+                    upgraded: Symbol::new(&env, "upgraded"),
                     proof_id: proof_id.clone(),
                     previous: prev.version,
                     current: version,
@@ -2456,6 +5850,7 @@ impl HarpocratesRegistry {
             }
         } else {
             MetadataEnvelopeBound {
+                bound: Symbol::new(&env, "bound"),
                 proof_id: proof_id.clone(),
                 version,
                 metadata_hash: metadata_hash.clone(),
@@ -2480,7 +5875,7 @@ impl HarpocratesRegistry {
     /// `METADATA_ENVELOPE_VERSION_DEFAULT` for proofs that exist without an
     /// explicit envelope row (pre-#317 / stamped callers). Returns `0` when
     /// the proof is unknown (callers must treat 0 as not-found).
-    pub fn resolve_metadata_envelope_version(env: Env, proof_id: BytesN<32>) -> u32 {
+    pub fn resolve_metadata_envelope_ver(env: Env, proof_id: BytesN<32>) -> u32 {
         if let Some(envelope) = env
             .storage()
             .persistent()
@@ -2488,21 +5883,16 @@ impl HarpocratesRegistry {
         {
             return envelope.version;
         }
-        if env
-            .storage()
-            .persistent()
-            .has(&DataKey::Proof(proof_id))
-        {
+        if env.storage().persistent().has(&DataKey::Proof(proof_id)) {
             return METADATA_ENVELOPE_VERSION_DEFAULT;
         }
         0
     }
 
     /// Whether `version` is accepted by this wasm build.
-    pub fn is_supported_metadata_envelope_version(_env: Env, version: u32) -> bool {
+    pub fn is_supported_envelope_version(_env: Env, version: u32) -> bool {
         version >= METADATA_ENVELOPE_V1 && version <= METADATA_ENVELOPE_VERSION_MAX
     }
-
 
     pub fn get_proof(env: Env, proof_id: BytesN<32>) -> Option<ProofRecord> {
         env.storage().persistent().get(&DataKey::Proof(proof_id))
@@ -2514,42 +5904,477 @@ impl HarpocratesRegistry {
         proof_id.and_then(|id| env.storage().persistent().get(&DataKey::Proof(id)))
     }
 
-    pub fn has_nullifier(env: Env, nullifier: BytesN<32>) -> bool {
-        env.storage()
-            .persistent()
-            .has(&DataKey::Nullifier(nullifier))
+    /// Return the verification status of multiple videos in a single batch query,
+    /// resolving video hashes to their underlying proof verification statuses.
+    ///
+    /// Unknown video hashes return `ProofVerificationStatus::NotFound` instead of failing the batch.
+    /// The maximum number of video hashes in a single batch is bounded (100) to match `get_proof_statuses`.
+    pub fn get_statuses_by_video(
+        env: Env,
+        video_hashes: soroban_sdk::Vec<BytesN<32>>,
+    ) -> soroban_sdk::Vec<ProofVerificationStatus> {
+        let max_batch_size = 100;
+        if video_hashes.len() > max_batch_size {
+            panic_with_error!(&env, RegistryError::BatchTooLarge);
+        }
+
+        let mut statuses = SorobanVec::new(&env);
+        for video_hash in video_hashes.iter() {
+            let proof_id: Option<BytesN<32>> =
+                env.storage().persistent().get(&DataKey::Video(video_hash));
+            let status = match proof_id {
+                Some(id) => Self::get_proof_status(env.clone(), id),
+                None => ProofVerificationStatus::NotFound,
+            };
+            statuses.push_back(status);
+        }
+        statuses
+    }
+
+    pub fn has_nullifier(env: Env, verifier: Address, nullifier: BytesN<32>) -> bool {
+        if env.storage().persistent().has(&DataKey::VerifierNullifier(verifier, nullifier.clone())) {
+            true
+        } else {
+            env.storage().persistent().has(&DataKey::Nullifier(nullifier))
+        }
     }
 
     pub fn get_issuer(env: Env, issuer: Address) -> Option<IssuerRecord> {
         env.storage().persistent().get(&DataKey::Issuer(issuer))
     }
 
+    /// Read-only query: assess whether an institutional role can be revoked
+    /// under current governance policy, identifying affected delegations,
+    /// outstanding approvals, and pending revocation proposals (#1193).
+    pub fn get_role_revocation_readiness(env: Env, role: Address) -> RoleRevocationReadinessReport {
+        let is_admin = match env.storage().persistent().get::<_, Address>(&DataKey::Admin) {
+            Some(admin) => admin == role,
+            None => false,
+        };
+
+        let issuer_record = env
+            .storage()
+            .persistent()
+            .get::<_, IssuerRecord>(&DataKey::Issuer(role.clone()));
+        let is_issuer = issuer_record.is_some();
+        let is_active_issuer = issuer_record.as_ref().map(|r| r.active).unwrap_or(false);
+
+        let council_opt = get_admin_council_record(&env);
+        let is_council_member = if let Some(ref council) = council_opt {
+            let mut member = false;
+            for m in council.members.iter() {
+                if m == role {
+                    member = true;
+                    break;
+                }
+            }
+            member
+        } else {
+            false
+        };
+
+        let delegations_affected = delegation_count(&env, &role);
+
+        let now = env.ledger().timestamp();
+        let council_active = is_council_active(&env);
+        let council_threshold = council_opt.as_ref().map(|c| c.threshold).unwrap_or(0);
+
+        let council_seq: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CouncilProposalSeq)
+            .unwrap_or(0);
+
+        let mut outstanding_approvals: u32 = 0;
+        let mut pending_revocation_proposals: u32 = 0;
+        let mut revocation_proposal_approvals: u32 = 0;
+        let mut council_threshold_met = false;
+
+        for id in 1..=council_seq {
+            if let Some(prop) = env
+                .storage()
+                .persistent()
+                .get::<_, CouncilProposal>(&DataKey::CouncilProposal(id))
+            {
+                if !prop.executed && !prop.cancelled && now <= prop.expires_at {
+                    for a in prop.approvals.iter() {
+                        if a == role {
+                            outstanding_approvals = outstanding_approvals.saturating_add(1);
+                            break;
+                        }
+                    }
+                    if prop.action == CouncilAction::RevokeIssuer as u32 && prop.target == role {
+                        pending_revocation_proposals =
+                            pending_revocation_proposals.saturating_add(1);
+                        let app_count = prop.approvals.len();
+                        if app_count > revocation_proposal_approvals {
+                            revocation_proposal_approvals = app_count;
+                        }
+                        if council_active
+                            && council_threshold > 0
+                            && app_count >= council_threshold
+                        {
+                            council_threshold_met = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        let timelock_seq: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ProposalSeq)
+            .unwrap_or(0);
+
+        let mut timelock_ready = false;
+        for id in 1..=timelock_seq {
+            if let Some(prop) = env
+                .storage()
+                .persistent()
+                .get::<_, TimelockProposal>(&DataKey::Proposal(id))
+            {
+                if !prop.executed && !prop.cancelled {
+                    if prop.action == ProposalAction::RevokeIssuer as u32 && prop.target == role {
+                        pending_revocation_proposals =
+                            pending_revocation_proposals.saturating_add(1);
+                        if now >= prop.min_execution_at {
+                            timelock_ready = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        let has_active_rotation_grace = if let Some(rot) = env
+            .storage()
+            .persistent()
+            .get::<_, IssuerRotationRecord>(&DataKey::IssuerRotation(role.clone()))
+        {
+            now < rot.grace_expires_at
+        } else {
+            false
+        };
+
+        let revocation_ready = if is_active_issuer {
+            if council_active {
+                council_threshold_met || timelock_ready
+            } else {
+                true
+            }
+        } else {
+            false
+        };
+
+        RoleRevocationReadinessReport {
+            role,
+            is_issuer,
+            is_active_issuer,
+            is_council_member,
+            is_admin,
+            delegations_affected,
+            outstanding_approvals,
+            pending_revocation_proposals,
+            revocation_proposal_approvals,
+            has_active_rotation_grace,
+            council_governance_active: council_active,
+            revocation_ready,
+        }
+    }
+
+    /// Convenience alias for `get_role_revocation_readiness` (#1193).
+    pub fn get_institutional_role_revocation_readiness(
+        env: Env,
+        role: Address,
+    ) -> RoleRevocationReadinessReport {
+        Self::get_role_revocation_readiness(env, role)
+    }
+
+    /// Record a verifiable derivative of one or more existing artefacts, and
+    /// persist the parent content commitments for privacy-preserving public
+    /// boundaries (#332, #333).
+    ///
+    /// Parent commitments are derived on-chain from each parent's stored public
+    /// fields so callers cannot supply forged bindings. `depth` is the depth the
+    /// caller believes this derivative sits at: it is checked against the depth
+    /// implied by the parents rather than trusted, so a caller cannot claim a
+    /// shallow position to slip past `MAX_LINEAGE_DEPTH`; the stored record and
+    /// the published event always carry the derived depth.
+    ///
+    /// Fails with `LineageFanOutExceeded` (#60) when the parent set exceeds
+    /// `MAX_LINEAGE_FANOUT`, `LineageFanOutSaturated` (#97) when a parent
+    /// already has `MAX_LINEAGE_FANOUT` derivatives, `LineageCycle` (#58) for a
+    /// self-referential edge, `LineageTooDeep` (#59) past `MAX_LINEAGE_DEPTH`,
+    /// `LineageDepthMismatch` (#96) for a forged depth, `DuplicateLineage` (#78)
+    /// for an output digest that is already recorded, `LineageEmptyParents`
+    /// (#76) for an empty parent set, `LineageParentUnavailable` (#77) for a
+    /// revoked or expired proof parent, and `InvalidLineage` (#57) for a
+    /// duplicated or unknown parent set.
     pub fn register_lineage(
         env: Env,
         actor: Address,
-        parent_proof_ids: SorobanVec<BytesN<32>>,
+        parent_proof_ids: soroban_sdk::Vec<BytesN<32>>,
         manifest_digest: BytesN<32>,
         operation_type: Symbol,
         output_digest: BytesN<32>,
         depth: u32,
     ) -> LineageRecord {
+        require_initialized(&env);
         actor.require_auth();
-        validate_lineage(&env, &parent_proof_ids, &output_digest, depth);
+
+        // A lineage record is immutable evidence. Re-registering an output
+        // digest would let any caller overwrite a recorded derivation and spend
+        // a parent's fan-out budget without producing a new derivative.
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::Lineage(output_digest.clone()))
+        {
+            panic_with_error!(&env, RegistryError::DuplicateLineage);
+        }
+
+        let derived_depth = validate_lineage(&env, &parent_proof_ids, &output_digest, depth);
+        let parent_commitments = collect_lineage_parent_commitments(&env, &parent_proof_ids);
 
         let record = LineageRecord {
             parent_proof_ids: parent_proof_ids.clone(),
+            parent_commitments: parent_commitments.clone(),
             manifest_digest: manifest_digest.clone(),
             actor: actor.clone(),
             operation_type: operation_type.clone(),
             output_digest: output_digest.clone(),
-            depth,
+            depth: derived_depth,
         };
-        env.storage().persistent().set(&DataKey::Lineage(output_digest.clone()), &record);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Lineage(output_digest.clone()), &record);
+
+        LineageRegistered {
+            output_digest: output_digest.clone(),
+            manifest_digest: manifest_digest.clone(),
+            actor: actor.clone(),
+            operation_type: operation_type.clone(),
+            depth: derived_depth,
+            parent_commitments,
+        }
+        .publish(&env);
+
+        // Index this derivative under each parent for reverse (children) queries (#335).
+        for parent in parent_proof_ids.iter() {
+            append_lineage_child(&env, &parent, &output_digest);
+        }
+
         record
     }
 
     pub fn get_lineage(env: Env, output_digest: BytesN<32>) -> Option<LineageRecord> {
-        env.storage().persistent().get(&DataKey::Lineage(output_digest))
+        env.storage()
+            .persistent()
+            .get(&DataKey::Lineage(output_digest))
+    }
+
+    // -----------------------------------------------------------------------
+    // Independent timestamp claims (#339)
+    // -----------------------------------------------------------------------
+
+    /// Anchor an independent timestamp claim for an existing proof.
+    ///
+    /// Always records the current ledger timestamp/sequence as a Stellar
+    /// independent source. Optional `claimed_time` and RFC 3161 commitment
+    /// raise assurance without storing raw tokens or private material.
+    ///
+    /// Re-anchoring is allowed only when the new claim is a strict assurance
+    /// upgrade (or adds an RFC 3161 commitment). Compatible callers that omit
+    /// timestamp claims are unaffected.
+    pub fn anchor_timestamp_claim(
+        env: Env,
+        actor: Address,
+        proof_id: BytesN<32>,
+        attestation_digest: BytesN<32>,
+        claimed_time: u64,
+        rfc3161_commitment: BytesN<32>,
+    ) -> TimestampClaim {
+        // Proof must exist.
+        if !env
+            .storage()
+            .persistent()
+            .has(&DataKey::Proof(proof_id.clone()))
+        {
+            panic_with_error!(&env, RegistryError::TimestampClaimNotFound);
+        }
+
+        let proof = get_proof_record(&env, &proof_id);
+        require_timestamp_claim_actor(&env, &actor, &proof);
+
+        // Reject zero attestation digest (must bind to off-chain envelope).
+        let zero = BytesN::from_array(&env, &[0u8; 32]);
+        if attestation_digest == zero {
+            panic_with_error!(&env, RegistryError::InvalidTimestampClaim);
+        }
+
+        let now = env.ledger().timestamp();
+        if claimed_time > 0 && claimed_time > now.saturating_add(MAX_TIMESTAMP_FUTURE_DRIFT_SECS) {
+            panic_with_error!(&env, RegistryError::InvalidTimestampClaim);
+        }
+
+        let has_rfc3161 = rfc3161_commitment != zero;
+        // Empty commitment is fine; non-empty is treated as RFC 3161 present.
+        // (No further parsing on-chain — resource-bounded by fixed 32 bytes.)
+
+        let mut sources = TIMESTAMP_SOURCE_STELLAR;
+        if claimed_time > 0 {
+            sources |= TIMESTAMP_SOURCE_CLAIMED;
+        }
+        if has_rfc3161 {
+            sources |= TIMESTAMP_SOURCE_RFC3161;
+        }
+
+        let assurance = compute_timestamp_assurance(sources);
+        let ledger_sequence = env.ledger().sequence();
+
+        let claim = TimestampClaim {
+            proof_id: proof_id.clone(),
+            attestation_digest: attestation_digest.clone(),
+            claimed_time,
+            anchored_at: now,
+            ledger_sequence,
+            sources,
+            rfc3161_commitment: if has_rfc3161 {
+                rfc3161_commitment
+            } else {
+                zero
+            },
+            actor: actor.clone(),
+            assurance,
+        };
+
+        let key = DataKey::TimestampClaim(proof_id.clone());
+        if let Some(existing) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, TimestampClaim>(&key)
+        {
+            // Allow only upgrades: higher assurance, or same assurance with new RFC3161.
+            let adds_rfc3161 = has_rfc3161 && (existing.sources & TIMESTAMP_SOURCE_RFC3161) == 0;
+            if assurance < existing.assurance || (assurance == existing.assurance && !adds_rfc3161)
+            {
+                panic_with_error!(&env, RegistryError::TimestampClaimAlreadyAnchored);
+            }
+        }
+
+        env.storage().persistent().set(&key, &claim);
+
+        TimestampClaimAnchored {
+            proof_id: proof_id.clone(),
+            attestation_digest: attestation_digest.clone(),
+            sources,
+            assurance,
+            anchored_at: now,
+            ledger_sequence,
+        }
+        .publish(&env);
+
+        claim
+    }
+
+    /// Return the timestamp claim for `proof_id`, if any.
+    pub fn get_timestamp_claim(env: Env, proof_id: BytesN<32>) -> Option<TimestampClaim> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::TimestampClaim(proof_id))
+    }
+
+    /// Whether the proof has an independently verifiable on-chain timestamp
+    /// source (Stellar ledger and/or RFC 3161 commitment).
+    pub fn has_independent_timestamp_anchor(env: Env, proof_id: BytesN<32>) -> bool {
+        match env
+            .storage()
+            .persistent()
+            .get::<DataKey, TimestampClaim>(&DataKey::TimestampClaim(proof_id))
+        {
+            Some(claim) => {
+                (claim.sources & (TIMESTAMP_SOURCE_STELLAR | TIMESTAMP_SOURCE_RFC3161)) != 0
+            }
+            None => false,
+        }
+    }
+    /// Return only the stored parent commitments for `output_digest` (#332).
+    ///
+    /// Useful for interoperable consumers that must not pull full lineage
+    /// topology (parent proof ids) across a trust boundary.
+    pub fn get_lineage_parent_commitments(
+        env: Env,
+        output_digest: BytesN<32>,
+    ) -> Option<soroban_sdk::Vec<BytesN<32>>> {
+        let record: Option<LineageRecord> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Lineage(output_digest));
+        record.map(|r| r.parent_commitments)
+    }
+
+    /// Return how many child digests are indexed under `parent_proof_id` (#335).
+    pub fn get_lineage_children_count(env: Env, parent_proof_id: BytesN<32>) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::LineageChildSeq(parent_proof_id))
+            .unwrap_or(0)
+    }
+
+    /// Paginate child output digests for a parent proof or lineage digest (#335).
+    ///
+    /// - `offset` is 0-based into the stable registration order.
+    /// - `limit` must be in `1..=MAX_LINEAGE_CHILDREN_PAGE`.
+    /// - Missing parents yield an empty page with `total == 0` (privacy-safe).
+    pub fn list_lineage_children(
+        env: Env,
+        parent_proof_id: BytesN<32>,
+        offset: u32,
+        limit: u32,
+    ) -> LineageChildrenPage {
+        if limit == 0 || limit > MAX_LINEAGE_CHILDREN_PAGE {
+            panic_with_error!(&env, RegistryError::LineageChildrenLimitExceeded);
+        }
+
+        let total: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::LineageChildSeq(parent_proof_id.clone()))
+            .unwrap_or(0);
+
+        let mut children = SorobanVec::new(&env);
+        if offset >= total {
+            return LineageChildrenPage {
+                children,
+                next_offset: total,
+                total,
+            };
+        }
+
+        let end = if total - offset < limit {
+            total
+        } else {
+            offset + limit
+        };
+
+        let mut idx = offset;
+        while idx < end {
+            let seq = idx + 1; // 1-based storage keys
+            if let Some(child) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, BytesN<32>>(&DataKey::LineageChild(parent_proof_id.clone(), seq))
+            {
+                children.push_back(child);
+            }
+            idx += 1;
+        }
+
+        LineageChildrenPage {
+            children,
+            next_offset: end,
+            total,
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -2558,9 +6383,46 @@ impl HarpocratesRegistry {
 
     pub fn set_revocation_root(env: Env, admin: Address, revocation_root: BytesN<32>) {
         require_admin(&env, &admin);
+        if is_council_active(&env) {
+            panic_with_error!(&env, RegistryError::InsufficientApprovals);
+        }
+        let history: SorobanVec<RevocationRootEntry> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::RevocationRoots)
+            .unwrap_or_else(|| {
+                let mut history = SorobanVec::new(&env);
+                if let Some(previous_root) = env
+                    .storage()
+                    .persistent()
+                    .get::<DataKey, BytesN<32>>(&DataKey::RevocationRoot)
+                {
+                    if previous_root != revocation_root {
+                        history.push_back(RevocationRootEntry {
+                            root: previous_root,
+                            activation_ledger: 0,
+                        });
+                    }
+                }
+                history
+            });
+        let keep_from = history
+            .len()
+            .saturating_sub(MAX_REVOCATION_ROOT_HISTORY.saturating_sub(1));
+        let mut next_history = SorobanVec::new(&env);
+        for index in keep_from..history.len() {
+            next_history.push_back(history.get(index).unwrap());
+        }
+        next_history.push_back(RevocationRootEntry {
+            root: revocation_root.clone(),
+            activation_ledger: env.ledger().sequence(),
+        });
         env.storage()
             .persistent()
             .set(&DataKey::RevocationRoot, &revocation_root);
+        env.storage()
+            .persistent()
+            .set(&DataKey::RevocationRoots, &next_history);
         RevocationRootSet { revocation_root }.publish(&env);
     }
 
@@ -2568,17 +6430,70 @@ impl HarpocratesRegistry {
         env.storage().persistent().get(&DataKey::RevocationRoot)
     }
 
+    /// Return the bounded history of recent revocation roots in chronological
+    /// order (oldest first, current active root last), up to
+    /// [`MAX_REVOCATION_ROOT_HISTORY`] entries.
+    pub fn get_revocation_roots(env: Env) -> soroban_sdk::Vec<RevocationRootEntry> {
+        if let Some(history) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, SorobanVec<RevocationRootEntry>>(&DataKey::RevocationRoots)
+        {
+            return history;
+        }
+        let mut fallback = SorobanVec::new(&env);
+        if let Some(current) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, BytesN<32>>(&DataKey::RevocationRoot)
+        {
+            fallback.push_back(RevocationRootEntry {
+                root: current,
+                activation_ledger: 0,
+            });
+        }
+        fallback
+    }
+
+    /// Configure the grace window (in ledgers) during which recent previous
+    /// revocation roots in the ring buffer remain accepted by
+    /// [`Self::check_non_revocation`].
+    ///
+    /// Admin-only. Setting `grace_ledgers == 0` disables the grace window so
+    /// only the current root is accepted. Values above
+    /// [`MAX_REVOCATION_ROOT_GRACE_LEDGERS`] are rejected with
+    /// [`RegistryError::InvalidPublicInputs`].
+    pub fn set_revocation_root_grace_window(env: Env, admin: Address, grace_ledgers: u32) {
+        require_admin(&env, &admin);
+        if grace_ledgers > MAX_REVOCATION_ROOT_GRACE_LEDGERS {
+            panic_with_error!(&env, RegistryError::InvalidPublicInputs);
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::RevocationRootGraceWindow, &grace_ledgers);
+    }
+
+    /// Return the configured grace window (in ledgers) for accepting previous
+    /// revocation roots, defaulting to [`DEFAULT_REVOCATION_ROOT_GRACE_LEDGERS`].
+    pub fn get_revocation_root_grace_window(env: Env) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::RevocationRootGraceWindow)
+            .unwrap_or(DEFAULT_REVOCATION_ROOT_GRACE_LEDGERS)
+    }
+
     /// Verify a non-revocation proof produced by the `revocation_witness`
     /// Noir circuit.
     ///
     /// The proof demonstrates that `credential_root` is **not** a member of
-    /// the currently-published revocation tree (`revocation_root`) without
+    /// the currently-published revocation tree (`revocation_root`) — or a
+    /// recent previous root still within the configured grace window — without
     /// revealing which revoked credentials exist or which identity is acting.
     ///
     /// # Public input layout (128 bytes, 4 x BN254 field elements)
     ///
     /// ```text
-    /// [  0.. 32)  revocation_root   - must match the on-chain stored root
+    /// [  0.. 32)  revocation_root   - must match the current root or a recent root within the grace window
     /// [ 32.. 64)  nullifier         - one-use replay guard
     /// [ 64.. 96)  domain_separator  - must match REVOCATION_DOMAIN_SEPARATOR
     /// [ 96..128)  credential_root   - must be registered & active on-chain
@@ -2588,7 +6503,7 @@ impl HarpocratesRegistry {
     ///
     /// - `NotInitialized`      if no revocation root has been published yet
     /// - `VerifierNotSet`       if no external verifier contract is configured
-    /// - `InvalidPublicInputs`  if the domain separator or layout is wrong
+    /// - `InvalidPublicInputs`  if the domain separator, layout, or revocation root (unknown/outside grace window) is invalid
     /// - `UnknownCredentialRoot` if the credential has not been registered
     /// - `RevokedCredentialRoot` if the credential root has been revoked
     /// - `DuplicateNullifier`   if this nullifier was already consumed
@@ -2602,36 +6517,90 @@ impl HarpocratesRegistry {
             panic_with_error!(&env, RegistryError::InvalidPublicInputs);
         }
 
-        // 2. Revocation root - must match the currently published root.
+        // 2. Revocation root - must match the currently published root or a
+        //    recent root in the bounded history ring buffer within the grace window.
         let stored_root: BytesN<32> = env
             .storage()
             .persistent()
             .get(&DataKey::RevocationRoot)
             .unwrap_or_else(|| panic_with_error!(&env, RegistryError::NotInitialized));
+
         if parsed.revocation_root != stored_root {
-            panic_with_error!(&env, RegistryError::InvalidPublicInputs);
+            let history: SorobanVec<RevocationRootEntry> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::RevocationRoots)
+                .unwrap_or_else(|| SorobanVec::new(&env));
+            let grace_ledgers: u32 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::RevocationRootGraceWindow)
+                .unwrap_or(DEFAULT_REVOCATION_ROOT_GRACE_LEDGERS);
+            let current_ledger = env.ledger().sequence();
+
+            // Locate `parsed.revocation_root` in the history buffer.
+            // A previous root at index `i` was superseded when the next root
+            // at index `i + 1` was activated (`superseded_at = history[i + 1].activation_ledger`),
+            // and remains valid while `current_ledger <= superseded_at + grace_ledgers`
+            // (with `grace_ledgers > 0`) AND `current_ledger <= entry.activation_ledger + grace_ledgers`
+            // is also respected when checking age since replacement. Specifically, a root is
+            // within the grace window if `grace_ledgers > 0` and the time elapsed since it was
+            // superseded (or since its activation) is within `grace_ledgers`.
+            let len = history.len();
+            let mut matched_valid = false;
+            let mut idx = 0;
+            while idx < len {
+                if let Some(entry) = history.get(idx) {
+                    if entry.root == parsed.revocation_root {
+                        // Determine the ledger at which this root was replaced by a newer root,
+                        // or its own activation ledger if it is the last entry.
+                        let reference_ledger = if idx + 1 < len {
+                            history
+                                .get(idx + 1)
+                                .map(|next| next.activation_ledger)
+                                .unwrap_or(entry.activation_ledger)
+                        } else {
+                            entry.activation_ledger
+                        };
+                        let age_since_activation =
+                            current_ledger.saturating_sub(entry.activation_ledger);
+                        let age_since_replacement =
+                            current_ledger.saturating_sub(reference_ledger);
+                        if grace_ledgers > 0
+                            && age_since_activation <= grace_ledgers
+                            && age_since_replacement <= grace_ledgers
+                        {
+                            matched_valid = true;
+                        }
+                        break;
+                    }
+                }
+                idx += 1;
+            }
+
+            if !matched_valid {
+                panic_with_error!(&env, RegistryError::InvalidPublicInputs);
+            }
         }
 
         require_active_credential_root(&env, &parsed.credential_root);
-
-        if env
-            .storage()
-            .persistent()
-            .has(&DataKey::Nullifier(parsed.nullifier.clone()))
-        {
-            panic_with_error!(&env, RegistryError::DuplicateNullifier);
-        }
 
         let verifier: Address = env
             .storage()
             .persistent()
             .get(&DataKey::Verifier)
             .unwrap_or_else(|| panic_with_error!(&env, RegistryError::VerifierNotSet));
-        verify_external_proof(&env, &verifier, public_inputs, proof);
+        require_verified_proof(
+            &env,
+            &verifier,
+            CIRCUIT_VERSION_REVOCATION_WITNESS,
+            public_inputs,
+            proof,
+        );
 
         env.storage()
             .persistent()
-            .set(&DataKey::Nullifier(parsed.nullifier.clone()), &true);
+            .set(&DataKey::VerifierNullifier(verifier, parsed.nullifier.clone()), &true);
 
         NonRevocationChecked {
             credential_root: parsed.credential_root,
@@ -2650,10 +6619,49 @@ impl HarpocratesRegistry {
     /// revoke the guardian role.
     pub fn set_guardian(env: Env, admin: Address, guardian: Address) {
         require_admin(&env, &admin);
+        let prev_guardian: Option<Address> = env.storage().persistent().get(&DataKey::Guardian);
         env.storage()
             .persistent()
             .set(&DataKey::Guardian, &guardian);
-        GuardianSet { guardian }.publish(&env);
+        GuardianSet { guardian: guardian.clone() }.publish(&env);
+        if let Some(ref prev) = prev_guardian {
+            if prev != &guardian {
+                record_authority_history(
+                    &env,
+                    prev,
+                    ROLE_GUARDIAN,
+                    TRANSITION_REVOKED,
+                    Some(admin.clone()),
+                    None,
+                );
+            }
+        }
+        record_authority_history(
+            &env,
+            &guardian,
+            ROLE_GUARDIAN,
+            TRANSITION_ADDED,
+            Some(admin),
+            None,
+        );
+    }
+
+    /// Remove the emergency-pause guardian role. Admin-only.
+    pub fn clear_guardian(env: Env, admin: Address) {
+        require_admin(&env, &admin);
+        let prev_guardian: Option<Address> = env.storage().persistent().get(&DataKey::Guardian);
+        env.storage().persistent().remove(&DataKey::Guardian);
+        GuardianCleared {}.publish(&env);
+        if let Some(ref g) = prev_guardian {
+            record_authority_history(
+                &env,
+                g,
+                ROLE_GUARDIAN,
+                TRANSITION_REVOKED,
+                Some(admin),
+                None,
+            );
+        }
     }
 
     /// The currently configured guardian, if any.
@@ -2759,10 +6767,11 @@ impl HarpocratesRegistry {
     /// size and no storage is touched, so it is safe to expose publicly and
     /// safe to call while any domain is paused.
     ///
-    /// `schema_id` is [`SCHEMA_ID_SILENT_WITNESS`] or
-    /// [`SCHEMA_ID_REVOCATION_WITNESS`]. `proof_len` is the length of the proof
-    /// blob the caller intends to submit — passed as a length rather than the
-    /// blob itself so classification never transports proof material.
+    /// `schema_id` is [`SCHEMA_ID_SILENT_WITNESS`],
+    /// [`SCHEMA_ID_SILENT_WITNESS_V2`], or [`SCHEMA_ID_REVOCATION_WITNESS`].
+    /// `proof_len` is the length of the proof blob the caller intends to submit
+    /// — passed as a length rather than the blob itself so classification never
+    /// transports proof material.
     ///
     /// Returns [`verifier_inputs::ACCEPTED_CODE`] (`0`) when the material is
     /// canonical, otherwise the stable [`RejectCode::as_code`] value. This is
@@ -2774,7 +6783,7 @@ impl HarpocratesRegistry {
     /// `docs/zk-conformance-vectors.md`; promoting the codec to enforcement is
     /// a separate, versioned migration.
     pub fn classify_public_inputs(
-        env: Env,
+        _env: Env,
         schema_id: u32,
         public_inputs: Bytes,
         proof_len: u32,
@@ -2782,20 +6791,48 @@ impl HarpocratesRegistry {
         // Schema dispatch precedes the length check, matching the Python and
         // TypeScript layers: an unrecognised schema is reported as such even
         // when the frame is also the wrong length.
-        if schema_id != SCHEMA_ID_SILENT_WITNESS && schema_id != SCHEMA_ID_REVOCATION_WITNESS {
+        if schema_id != SCHEMA_ID_SILENT_WITNESS
+            && schema_id != SCHEMA_ID_SILENT_WITNESS_V2
+            && schema_id != SCHEMA_ID_REVOCATION_WITNESS
+        {
             return RejectCode::UnknownSchema.as_code();
         }
 
-        if public_inputs.len() as usize != PUBLIC_INPUTS_LEN {
+        // Each schema has its own frame length (silent witness v1 160 bytes,
+        // the circuit-versioned v2 envelope 256 bytes, revocation 128 bytes),
+        // matching `verifier_inputs::classify`.
+        let silent_v1 = schema_id == SCHEMA_ID_SILENT_WITNESS;
+        let silent_v2 = schema_id == SCHEMA_ID_SILENT_WITNESS_V2;
+        let expected_len: u32 = if silent_v1 {
+            SILENT_WITNESS_V1_INPUT_LEN
+        } else if silent_v2 {
+            verifier_inputs::SILENT_WITNESS_V2_PUBLIC_INPUTS_LEN as u32
+        } else {
+            REVOCATION_PUBLIC_INPUTS_LEN as u32
+        };
+        if public_inputs.len() != expected_len {
             return RejectCode::Length.as_code();
         }
 
-        let mut frame = [0u8; PUBLIC_INPUTS_LEN];
-        public_inputs.copy_into_slice(&mut frame);
-
-        let parsed = if schema_id == SCHEMA_ID_SILENT_WITNESS {
-            verifier_inputs::parse_silent_witness(&frame).map(|_| ())
+        let parsed = if silent_v1 {
+            let mut frame = [0u8; PUBLIC_INPUTS_LEN];
+            public_inputs.copy_into_slice(&mut frame);
+            verifier_inputs::parse_silent_witness(
+                &frame,
+                &verifier_inputs::SILENT_WITNESS_DOMAIN_TAG_BE,
+            )
+            .map(|_| ())
+        } else if silent_v2 {
+            let mut frame = [0u8; verifier_inputs::SILENT_WITNESS_V2_PUBLIC_INPUTS_LEN];
+            public_inputs.copy_into_slice(&mut frame);
+            verifier_inputs::parse_silent_witness_v2(
+                &frame,
+                &verifier_inputs::SILENT_WITNESS_DOMAIN_TAG_BE,
+            )
+            .map(|_| ())
         } else {
+            let mut frame = [0u8; REVOCATION_PUBLIC_INPUTS_LEN];
+            public_inputs.copy_into_slice(&mut frame);
             verifier_inputs::parse_revocation_witness(&frame, &REVOCATION_DOMAIN_SEPARATOR)
                 .map(|_| ())
         };
@@ -2808,6 +6845,83 @@ impl HarpocratesRegistry {
             Ok(()) => verifier_inputs::ACCEPTED_CODE,
             Err(code) => code.as_code(),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Proof statement compatibility descriptor
+    // -----------------------------------------------------------------------
+
+    /// Return the bounded proof statement compatibility descriptor for this
+    /// registry deployment.
+    ///
+    /// Read-only, side-effect free, and bounded: describes the accepted schema
+    /// selectors, verifier-input codec versions, active circuit-version window,
+    /// proof-blob size window, and supported critical-field bitmasks. Safe to
+    /// call without authentication and while any registration domain is paused.
+    /// No private witness values, nullifiers, or media commitments are surfaced.
+    pub fn get_proof_statement_compatibility(env: Env) -> ProofStatementCompatibilityDescriptor {
+        let (min_circuit_version, max_circuit_version) = get_verifier_circuit_versions_raw(&env);
+        let mut schemas: SorobanVec<ProofStatementSchemaDescriptor> = SorobanVec::new(&env);
+        for entry in verifier_inputs::SUPPORTED_SCHEMAS.iter() {
+            schemas.push_back(ProofStatementSchemaDescriptor {
+                schema_id: entry.schema_id,
+                verifier_input_version: entry.verifier_input_version,
+                circuit_version: entry.circuit_version,
+                public_inputs_len: entry.public_inputs_len,
+                supported_critical_fields: entry.supported_critical_fields,
+            });
+        }
+
+        ProofStatementCompatibilityDescriptor {
+            descriptor_version: verifier_inputs::COMPATIBILITY_DESCRIPTOR_VERSION,
+            min_verifier_input_version: verifier_inputs::MIN_VERIFIER_INPUT_VERSION,
+            max_verifier_input_version: verifier_inputs::MAX_VERIFIER_INPUT_VERSION,
+            min_circuit_version,
+            max_circuit_version,
+            min_proof_bytes: verifier_inputs::MIN_PROOF_BYTES,
+            max_proof_bytes: verifier_inputs::MAX_PROOF_BYTES,
+            supported_critical_fields: verifier_inputs::CRITICAL_FIELDS_ALL_SUPPORTED,
+            fail_closed_on_unknown_critical_fields: true,
+            schemas,
+        }
+    }
+
+    /// Fail-closed pre-flight check for a proof statement's schema selector,
+    /// verifier-input codec version, active circuit-version window, and
+    /// required critical-field bitmask.
+    ///
+    /// Returns [`verifier_inputs::ACCEPTED_CODE`] (`0`) when compatible, or
+    /// the stable [`RejectCode::as_code`] value otherwise:
+    /// - [`RejectCode::UnknownSchema`] (`9`) for unknown `schema_id`
+    /// - [`RejectCode::VersionMismatch`] (`10`) for mismatched
+    ///   `verifier_input_version` or a schema whose circuit version falls
+    ///   outside the active verifier's circuit-version window
+    /// - [`RejectCode::UnsupportedCriticalField`] (`11`) when any bit in
+    ///   `required_critical_fields` is not supported by the selected schema
+    ///   (fail-closed on unknown or cross-schema critical fields)
+    pub fn check_proof_statement_compatibility(
+        env: Env,
+        schema_id: u32,
+        verifier_input_version: u32,
+        required_critical_fields: u32,
+    ) -> u32 {
+        let entry = match verifier_inputs::check_statement_compatibility(
+            schema_id,
+            verifier_input_version,
+            required_critical_fields,
+        ) {
+            Ok(entry) => entry,
+            Err(code) => return code.as_code(),
+        };
+
+        let (min_circuit_version, max_circuit_version) = get_verifier_circuit_versions_raw(&env);
+        if entry.circuit_version < min_circuit_version
+            || entry.circuit_version > max_circuit_version
+        {
+            return RejectCode::VersionMismatch.as_code();
+        }
+
+        verifier_inputs::ACCEPTED_CODE
     }
 
     // -----------------------------------------------------------------------
@@ -2824,7 +6938,11 @@ impl HarpocratesRegistry {
     ) {
         require_admin(&env, &admin);
 
-        if env.storage().persistent().has(&DataKey::Schema(schema_hash.clone())) {
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::Schema(schema_hash.clone()))
+        {
             panic_with_error!(&env, RegistryError::DuplicateProof);
         }
 
@@ -2865,18 +6983,16 @@ impl HarpocratesRegistry {
     }
 
     pub fn get_schema(env: Env, schema_hash: BytesN<32>) -> Option<SchemaRecord> {
-        env.storage().persistent().get(&DataKey::Schema(schema_hash))
+        env.storage()
+            .persistent()
+            .get(&DataKey::Schema(schema_hash))
     }
 
     // -----------------------------------------------------------------------
     // Selective disclosure verification
     // -----------------------------------------------------------------------
 
-    pub fn verify_selective_disclosure(
-        env: Env,
-        public_inputs: Bytes,
-        proof: Bytes,
-    ) {
+    pub fn verify_selective_disclosure(env: Env, public_inputs: Bytes, proof: Bytes) {
         let parsed = parse_selective_disclosure_inputs(&env, &public_inputs);
 
         if parsed.circuit_version != CURRENT_SELECTIVE_DISCLOSURE_VERSION as u32 {
@@ -2898,24 +7014,22 @@ impl HarpocratesRegistry {
 
         require_active_credential_root(&env, &parsed.credential_root);
 
-        if env
-            .storage()
-            .persistent()
-            .has(&DataKey::Nullifier(parsed.nullifier.clone()))
-        {
-            panic_with_error!(&env, RegistryError::DuplicateNullifier);
-        }
-
         let verifier: Address = env
             .storage()
             .persistent()
             .get(&DataKey::Verifier)
             .unwrap_or_else(|| panic_with_error!(&env, RegistryError::VerifierNotSet));
-        verify_external_proof(&env, &verifier, public_inputs, proof);
+        require_verified_proof(
+            &env,
+            &verifier,
+            CIRCUIT_VERSION_SELECTIVE_DISCLOSURE,
+            public_inputs,
+            proof,
+        );
 
         env.storage()
             .persistent()
-            .set(&DataKey::Nullifier(parsed.nullifier.clone()), &true);
+            .set(&DataKey::VerifierNullifier(verifier, parsed.nullifier.clone()), &true);
 
         SelectiveDisclosureVerified {
             schema_hash: parsed.schema_hash,
@@ -2924,6 +7038,90 @@ impl HarpocratesRegistry {
             evidence_digest: parsed.evidence_digest,
         }
         .publish(&env);
+    }
+
+    // -----------------------------------------------------------------------
+    // Paginated verifier-set inspection
+    // -----------------------------------------------------------------------
+
+    /// Return a bounded, stable page of the current verifier configuration.
+    ///
+    /// Slots are ordered: **Active → Pending → Previous**. Only non-None
+    /// slots appear in `entries`. `cursor` is a 0-based slot index; pass
+    /// `next_cursor` from the previous response to continue paging.
+    ///
+    /// # Arguments
+    ///
+    /// * `cursor` – starting slot index (0 = first populated slot). A cursor
+    ///   beyond the end of the populated list returns an empty page.
+    /// * `limit`  – maximum entries per page. Must be non-zero and at most
+    ///   `MAX_VERIFIER_LIST_LIMIT`. Returns `ListLimitExceeded` otherwise.
+    ///
+    /// # Privacy
+    ///
+    /// This is a read-only query equivalent to `get_verifier` — no private
+    /// witness values, credential secrets, nullifiers, or video hashes are
+    /// surfaced. An out-of-range cursor produces an empty page rather than a
+    /// revealing error, so a scanner cannot enumerate capacity by probing.
+    ///
+    /// # Migration / compatibility
+    ///
+    /// Additive: before any verifier is configured, returns an empty page.
+    /// Callers that only need the active verifier should use `get_verifier`.
+    pub fn list_verifiers(env: Env, cursor: u32, limit: u32) -> VerifierPage {
+        if limit == 0 || limit > MAX_VERIFIER_LIST_LIMIT {
+            panic_with_error!(&env, RegistryError::ListLimitExceeded);
+        }
+
+        // Build the ordered, flattened slot list from storage.
+        // Slots are built deterministically: Active → Pending → Previous.
+        // This avoids heap allocation of a variable-length list in no_std by
+        // using a fixed-size array of Option<VerifierEntry>.
+        let slots = collect_verifier_slots(&env);
+
+        // Count the total populated (non-None) slots across all positions.
+        let total_populated: u32 = slots.iter().filter(|s| s.is_some()).count() as u32;
+
+        let slot_len = slots.len() as u32;
+
+        // A cursor beyond the slot list always returns an empty page.
+        // This is intentional: it does not reveal the set size via an error.
+        let mut entries: SorobanVec<VerifierEntry> = SorobanVec::new(&env);
+        if cursor >= slot_len {
+            return VerifierPage {
+                entries,
+                next_cursor: None,
+                total_populated,
+            };
+        }
+
+        // Walk from `cursor` up to `limit` items, skipping None slots.
+        let mut idx = cursor;
+        let mut filled: u32 = 0;
+        while idx < slot_len && filled < limit {
+            if let Some(entry) = slots[idx as usize].clone() {
+                entries.push_back(entry);
+                filled += 1;
+            }
+            idx += 1;
+        }
+
+        // `next_cursor` is Some if there are any remaining slots (None or Some)
+        // that we have not yet reached. We only set it if there is actually
+        // a remaining populated slot; empty slots beyond are not worth paging.
+        let next_cursor = if idx < slot_len {
+            // Check whether any remaining slot is populated.
+            let has_more = slots[idx as usize..].iter().any(|s| s.is_some());
+            if has_more { Some(idx) } else { None }
+        } else {
+            None
+        };
+
+        VerifierPage {
+            entries,
+            next_cursor,
+            total_populated,
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -2986,11 +7184,24 @@ impl HarpocratesRegistry {
             panic_with_error!(&env, RegistryError::TooManyOpenDisputes);
         }
 
+        // 3b. Cap open disputes per reporter across all proofs.
+        let reporter_count_key = DataKey::ReporterOpenDisputeCount(reporter.clone());
+        let reporter_open_count: u32 = env
+            .storage()
+            .persistent()
+            .get(&reporter_count_key)
+            .unwrap_or(0u32);
+        if reporter_open_count >= MAX_OPEN_DISPUTES_PER_REPORTER {
+            panic_with_error!(&env, RegistryError::ReporterDisputesSaturated);
+        }
+
         // 4. Reporter cooldown (keyed by the privacy-safe reporter_hash).
+        // Uses temporary storage so entries do not consume persistent rent unnecessarily
+        // and are automatically reclaimed after the cooldown window.
         let cooldown_key = DataKey::ReporterCooldown(reporter_hash.clone());
         let last_open: u64 = env
             .storage()
-            .persistent()
+            .temporary()
             .get(&cooldown_key)
             .unwrap_or(0u64);
         let now = env.ledger().timestamp();
@@ -2998,8 +7209,14 @@ impl HarpocratesRegistry {
             panic_with_error!(&env, RegistryError::ReporterOnCooldown);
         }
 
-        // 5. Persist cooldown timestamp.
-        env.storage().persistent().set(&cooldown_key, &now);
+        // 5. Store cooldown timestamp in temporary storage with TTL matching the cooldown window.
+        env.storage().temporary().set(&cooldown_key, &now);
+        const REPORTER_COOLDOWN_LEDGERS: u32 = (REPORTER_COOLDOWN_SECS / 5) as u32;
+        env.storage().temporary().extend_ttl(
+            &cooldown_key,
+            REPORTER_COOLDOWN_LEDGERS,
+            REPORTER_COOLDOWN_LEDGERS,
+        );
 
         // 6. Compute deadlines.
         let respond_deadline = now.saturating_add(RESPOND_DEADLINE_SECS);
@@ -3011,6 +7228,7 @@ impl HarpocratesRegistry {
             reason,
             reporter_hash: reporter_hash.clone(),
             commitment_hash: commitment_hash.clone(),
+            reporter: reporter.clone(),
             status: DisputeStatus::Open,
             opened_at: now,
             respond_deadline,
@@ -3019,14 +7237,36 @@ impl HarpocratesRegistry {
             resolved_at: 0,
             superseded_by: None,
         };
+        let dispute_key = DataKey::Dispute(dispute_id.clone());
         env.storage()
             .persistent()
-            .set(&DataKey::Dispute(dispute_id.clone()), &record);
+            .set(&dispute_key, &record);
+        env.storage()
+            .persistent()
+            .extend_ttl(&dispute_key, BUMP_THRESHOLD_LEDGERS, BUMP_TARGET_LEDGERS);
 
-        // 8. Increment open-dispute counter.
+        // 8. Increment open-dispute counters (per proof and per reporter).
+        let proof_dispute_count_key = DataKey::ProofOpenDisputeCount(proof_id.clone());
+        env.storage().persistent().set(
+            &proof_dispute_count_key,
+            &(open_count + 1),
+        );
+        env.storage().persistent().extend_ttl(
+            &proof_dispute_count_key,
+            BUMP_THRESHOLD_LEDGERS,
+            BUMP_TARGET_LEDGERS,
+        );
         env.storage()
             .persistent()
-            .set(&DataKey::ProofOpenDisputeCount(proof_id.clone()), &(open_count + 1));
+            .set(&reporter_count_key, &(reporter_open_count + 1));
+        env.storage().persistent().extend_ttl(
+            &reporter_count_key,
+            BUMP_THRESHOLD_LEDGERS,
+            BUMP_TARGET_LEDGERS,
+        );
+
+        // 8b. Append dispute to per-proof dispute index.
+        append_proof_dispute(&env, &proof_id, &dispute_id);
 
         // 9. Emit event.
         DisputeOpened {
@@ -3102,9 +7342,22 @@ impl HarpocratesRegistry {
         record.response_commitment = Some(response_commitment.clone());
         record.resolve_deadline = now.saturating_add(RESOLVE_DEADLINE_SECS);
 
+        let dispute_key = DataKey::Dispute(dispute_id.clone());
         env.storage()
             .persistent()
-            .set(&DataKey::Dispute(dispute_id.clone()), &record);
+            .set(&dispute_key, &record);
+        env.storage()
+            .persistent()
+            .extend_ttl(&dispute_key, BUMP_THRESHOLD_LEDGERS, BUMP_TARGET_LEDGERS);
+
+        let proof_dispute_count_key = DataKey::ProofOpenDisputeCount(record.proof_id.clone());
+        if env.storage().persistent().has(&proof_dispute_count_key) {
+            env.storage().persistent().extend_ttl(
+                &proof_dispute_count_key,
+                BUMP_THRESHOLD_LEDGERS,
+                BUMP_TARGET_LEDGERS,
+            );
+        }
 
         DisputeResponded {
             dispute_id,
@@ -3146,12 +7399,17 @@ impl HarpocratesRegistry {
         record.status = DisputeStatus::Resolved;
         record.resolved_at = now;
 
+        let dispute_key = DataKey::Dispute(dispute_id.clone());
         env.storage()
             .persistent()
-            .set(&DataKey::Dispute(dispute_id.clone()), &record);
+            .set(&dispute_key, &record);
+        env.storage()
+            .persistent()
+            .extend_ttl(&dispute_key, BUMP_THRESHOLD_LEDGERS, BUMP_TARGET_LEDGERS);
 
-        // Decrement open-dispute counter.
+        // Decrement open-dispute counters (per proof and per reporter).
         decrement_open_dispute_count(&env, &record.proof_id);
+        decrement_reporter_open_dispute_count(&env, &record.reporter);
 
         DisputeResolved {
             dispute_id,
@@ -3184,12 +7442,17 @@ impl HarpocratesRegistry {
         record.status = DisputeStatus::Dismissed;
         record.resolved_at = now;
 
+        let dispute_key = DataKey::Dispute(dispute_id.clone());
         env.storage()
             .persistent()
-            .set(&DataKey::Dispute(dispute_id.clone()), &record);
+            .set(&dispute_key, &record);
+        env.storage()
+            .persistent()
+            .extend_ttl(&dispute_key, BUMP_THRESHOLD_LEDGERS, BUMP_TARGET_LEDGERS);
 
-        // Decrement open-dispute counter.
+        // Decrement open-dispute counters (per proof and per reporter).
         decrement_open_dispute_count(&env, &record.proof_id);
+        decrement_reporter_open_dispute_count(&env, &record.reporter);
 
         DisputeDismissed {
             dispute_id,
@@ -3254,15 +7517,20 @@ impl HarpocratesRegistry {
         record.superseded_by = Some(superseding_proof_id.clone());
         record.resolved_at = now;
 
+        let dispute_key = DataKey::Dispute(dispute_id.clone());
         env.storage()
             .persistent()
-            .set(&DataKey::Dispute(dispute_id.clone()), &record);
+            .set(&dispute_key, &record);
+        env.storage()
+            .persistent()
+            .extend_ttl(&dispute_key, BUMP_THRESHOLD_LEDGERS, BUMP_TARGET_LEDGERS);
 
         // Record the reverse supersession direction for cycle detection.
         record_supersession_direction(&env, &record.proof_id, &superseding_proof_id);
 
-        // Decrement open-dispute counter.
+        // Decrement open-dispute counters (per proof and per reporter).
         decrement_open_dispute_count(&env, &record.proof_id);
+        decrement_reporter_open_dispute_count(&env, &record.reporter);
 
         DisputeSuperseded {
             dispute_id,
@@ -3277,20 +7545,116 @@ impl HarpocratesRegistry {
 
     /// Retrieve a dispute record by its dispute_id.
     pub fn get_dispute(env: Env, dispute_id: BytesN<32>) -> Option<DisputeRecord> {
-        env.storage()
-            .persistent()
-            .get(&DataKey::Dispute(dispute_id))
+        let key = DataKey::Dispute(dispute_id);
+        let record: Option<DisputeRecord> = env.storage().persistent().get(&key);
+        if let Some(ref rec) = record {
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, BUMP_THRESHOLD_LEDGERS, BUMP_TARGET_LEDGERS);
+            let count_key = DataKey::ProofOpenDisputeCount(rec.proof_id.clone());
+            if env.storage().persistent().has(&count_key) {
+                env.storage()
+                    .persistent()
+                    .extend_ttl(&count_key, BUMP_THRESHOLD_LEDGERS, BUMP_TARGET_LEDGERS);
+            }
+        }
+        record
     }
 
     /// Return the number of currently Open disputes for a given proof.
     pub fn get_open_dispute_count(env: Env, proof_id: BytesN<32>) -> u32 {
+        let key = DataKey::ProofOpenDisputeCount(proof_id);
+        if env.storage().persistent().has(&key) {
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, BUMP_THRESHOLD_LEDGERS, BUMP_TARGET_LEDGERS);
+        }
         env.storage()
             .persistent()
-            .get(&DataKey::ProofOpenDisputeCount(proof_id))
+            .get(&key)
             .unwrap_or(0u32)
+    }
+
+    /// Return the number of currently open (non-terminal) disputes opened by
+    /// `reporter` across all proofs.
+    pub fn get_reporter_open_dispute_count(env: Env, reporter: Address) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ReporterOpenDisputeCount(reporter))
+            .unwrap_or(0u32)
+    }
+
+    /// Return the total number of disputes ever opened for a given proof.
+    pub fn get_proof_dispute_count(env: Env, proof_id: BytesN<32>) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ProofDisputeSeq(proof_id))
+            .unwrap_or(0u32)
+    }
+
+    /// Return dispute IDs for a proof in creation order with pagination.
+    ///
+    /// - `cursor` is the zero-based offset into the proof's disputes.
+    /// - `limit` is the maximum number of dispute IDs to return, capped by
+    ///   `MAX_PROOF_DISPUTES_PAGE`.
+    /// - Missing proofs or proofs without disputes yield an empty list (privacy-safe).
+    pub fn list_proof_disputes(
+        env: Env,
+        proof_id: BytesN<32>,
+        cursor: u32,
+        limit: u32,
+    ) -> Vec<BytesN<32>> {
+        let total: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ProofDisputeSeq(proof_id.clone()))
+            .unwrap_or(0);
+
+        let mut disputes = SorobanVec::new(&env);
+        if cursor >= total {
+            return disputes;
+        }
+
+        let effective_limit = if limit > MAX_PROOF_DISPUTES_PAGE {
+            MAX_PROOF_DISPUTES_PAGE
+        } else {
+            limit
+        };
+
+        if effective_limit == 0 {
+            return disputes;
+        }
+
+        let remaining = total - cursor;
+        let count = if remaining < effective_limit {
+            remaining
+        } else {
+            effective_limit
+        };
+
+        let end = cursor + count;
+        let mut idx = cursor;
+        while idx < end {
+            let seq = idx + 1; // 1-based storage keys
+            if let Some(dispute_id) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, BytesN<32>>(&DataKey::ProofDispute(proof_id.clone(), seq))
+            {
+                disputes.push_back(dispute_id);
+            }
+            idx += 1;
+        }
+
+        disputes
     }
 }
 
+fn require_initialized(env: &Env) {
+    if !env.storage().persistent().has(&DataKey::Admin) {
+        panic_with_error!(env, RegistryError::NotInitialized);
+    }
+}
 
 fn require_admin(env: &Env, candidate: &Address) {
     let admin: Option<Address> = env.storage().persistent().get(&DataKey::Admin);
@@ -3299,6 +7663,40 @@ fn require_admin(env: &Env, candidate: &Address) {
     candidate.require_auth();
     if &admin != candidate {
         panic_with_error!(env, RegistryError::Unauthorized);
+    }
+}
+
+/// Reject issuer role assignment to an address that currently holds registry
+/// administrator authority. Callers that create pending state must separately
+/// check the pending address so a proposal cannot be used to stage a conflict.
+fn require_issuer_role_available(env: &Env, issuer: &Address) {
+    let admin: Address = env
+        .storage()
+        .persistent()
+        .get(&DataKey::Admin)
+        .unwrap_or_else(|| panic_with_error!(env, RegistryError::NotInitialized));
+    if issuer == &admin {
+        panic_with_error!(env, RegistryError::RoleConflict);
+    }
+}
+
+/// Reject transferring admin authority to an address with active issuer
+/// authority. Revoked issuer records remain safe to transfer into and preserve
+/// the historical metadata returned by `get_issuer`.
+fn require_admin_role_available(env: &Env, candidate: &Address) {
+    require_issuer_role_available(env, candidate);
+    let issuer_record: Option<IssuerRecord> = env
+        .storage()
+        .persistent()
+        .get(&DataKey::Issuer(candidate.clone()));
+    if matches!(
+        issuer_record,
+        Some(IssuerRecord {
+            active: true,
+            ..
+        })
+    ) {
+        panic_with_error!(env, RegistryError::RoleConflict);
     }
 }
 
@@ -3325,6 +7723,82 @@ fn require_pauser(env: &Env, caller: &Address) -> bool {
     }
 }
 
+/// Require that `caller` may commit a receipt digest for `record`: either the
+/// registry admin (any tier) or the proof's own tier-2 source / tier-3 issuer.
+/// Tier 1 proofs carry no on-chain identity, so they are admin-only — the
+/// same precedent `respond_dispute` uses for anonymous proofs.
+///
+/// `caller.require_auth()` must already have run; this function only decides
+/// whether the (public) proof record names the caller.
+fn require_receipt_actor(env: &Env, caller: &Address, record: &ProofRecord) {
+    let admin: Address = env
+        .storage()
+        .persistent()
+        .get(&DataKey::Admin)
+        .unwrap_or_else(|| panic_with_error!(env, RegistryError::NotInitialized));
+    if caller == &admin {
+        return;
+    }
+
+    let matches_subject = match record.tier {
+        TIER_CONSISTENT_SOURCE => record.source.as_ref() == Some(caller),
+        TIER_PUBLIC_SEAL => record.issuer.as_ref() == Some(caller),
+        _ => false,
+    };
+    if !matches_subject {
+        panic_with_error!(env, RegistryError::Unauthorized);
+    }
+}
+
+/// Number of currently active receipt-signing keys.
+fn receipt_signer_count(env: &Env) -> u32 {
+    env.storage()
+        .persistent()
+        .get(&DataKey::ReceiptSignerCount)
+        .unwrap_or(0u32)
+}
+
+const RECEIPT_ATTEST_DOMAIN: [u8; 29] = *b"harpocrates:receipt-digest:v1";
+const RECEIPT_ATTEST_PREIMAGE_LEN: u32 = 129;
+
+/// Domain-separated digest a receipt signer must sign for
+/// `commit_receipt_digest` to accept a commitment.
+///
+/// Preimage layout (129 bytes, see `RECEIPT_ATTEST_PREIMAGE_LEN`):
+///
+/// ```text
+/// [  0.. 29)  RECEIPT_ATTEST_DOMAIN  "harpocrates:receipt-digest:v1"
+/// [ 29.. 65)  XDR of the calling contract's address
+///             (4-byte big-endian discriminant 1 || 32-byte contract id)
+/// [ 65.. 97)  proof_id
+/// [ 97..129)  receipt_digest
+/// ```
+///
+/// Binding the contract address keeps an attestation issued for one
+/// deployment from being replayed against another registry that happens to
+/// register the same signer key.
+fn receipt_attestation_digest(
+    env: &Env,
+    proof_id: &BytesN<32>,
+    receipt_digest: &BytesN<32>,
+) -> Hash<32> {
+    let mut preimage = Bytes::new(env);
+    preimage.extend_from_slice(&RECEIPT_ATTEST_DOMAIN);
+    // `to_xdr` serializes an Address as an ScVal: a 4-byte ScVal type tag
+    // followed by the ScAddress XDR (4-byte discriminant 1 || 32-byte
+    // contract id) that the attestation binds to. Keep only the ScAddress arm.
+    let contract_xdr = env.current_contract_address().to_xdr(env);
+    preimage.append(&contract_xdr.slice(4..40));
+    preimage.extend_from_slice(&proof_id.to_array());
+    preimage.extend_from_slice(&receipt_digest.to_array());
+
+    if preimage.len() != RECEIPT_ATTEST_PREIMAGE_LEN {
+        panic_with_error!(env, RegistryError::InvalidPublicInputs);
+    }
+
+    env.crypto().sha256(&preimage)
+}
+
 /// Reject `scope` unless it is nonzero and composed only of known
 /// `DELEGATION_SCOPE_*` bits.
 fn validate_delegation_scope(env: &Env, scope: u32) {
@@ -3340,6 +7814,53 @@ fn delegation_count(env: &Env, grantor: &Address) -> u32 {
         .unwrap_or(0)
 }
 
+/// Ledger-time window-bucket index for a quota of `window_secs` width.
+/// Integer division keeps buckets contiguous from the epoch, so a rollover
+/// is exactly `timestamp / window_secs` advancing by one.
+fn issuer_quota_bucket(env: &Env, window_secs: u64) -> u64 {
+    if window_secs == 0 {
+        return 0;
+    }
+    env.ledger().timestamp() / window_secs
+}
+
+/// Charge one registration against `subject`'s admin-set quota (#806).
+///
+/// No quota record means unlimited and costs one storage probe. Otherwise
+/// the stored `(bucket, count)` pair is rolled forward when the ledger has
+/// entered a new window bucket — the reset needs no admin transaction — and
+/// the count is incremented, or the call reverts with
+/// [`RegistryError::IssuerQuotaExhausted`]. A revert unwinds the increment,
+/// so a rejected registration never consumes quota.
+fn charge_issuer_quota(env: &Env, subject: &Address) {
+    let quota_key = DataKey::IssuerQuota(subject.clone());
+    let quota: Option<IssuerQuotaRecord> = env.storage().persistent().get(&quota_key);
+    let Some(quota) = quota else {
+        return;
+    };
+    // A zeroed record cannot be stored through `set_issuer_quota`, but treat
+    // one defensively as unlimited rather than dividing by zero below.
+    if quota.max_registrations == 0 || quota.window_secs == 0 {
+        return;
+    }
+
+    let bucket = issuer_quota_bucket(env, quota.window_secs);
+    let usage_key = DataKey::IssuerQuotaUsage(subject.clone());
+    let stored: Option<IssuerQuotaUsage> = env.storage().persistent().get(&usage_key);
+    let mut usage = match stored {
+        Some(usage) if usage.bucket == bucket => usage,
+        // A stale bucket (or one from an earlier, wider quota) is empty.
+        _ => IssuerQuotaUsage { bucket, count: 0 },
+    };
+
+    if usage.count >= quota.max_registrations {
+        panic_with_error!(env, RegistryError::IssuerQuotaExhausted);
+    }
+
+    usage.count += 1;
+    env.storage().persistent().set(&usage_key, &usage);
+}
+
 /// Require a live delegation from `grantor` to `delegate` carrying every bit of
 /// `scope`, and authorize the call.
 ///
@@ -3347,7 +7868,17 @@ fn delegation_count(env: &Env, grantor: &Address) -> u32 {
 /// insufficiently scoped — because an operator responding to a failed
 /// registration needs to know which one happened, and none of the three
 /// discloses anything about the media or the proof.
-fn require_delegation(env: &Env, grantor: &Address, delegate: &Address, scope: u32) {
+/// Resolve the caller's live delegation and require it to carry `scope`.
+///
+/// Returns the record so the caller can also bound its own artifact by the
+/// delegation's expiry (#338). Reverts with the stable `DelegationNotFound`,
+/// `DelegationExpired`, or `DelegationScopeExceeded` code.
+fn require_delegation(
+    env: &Env,
+    grantor: &Address,
+    delegate: &Address,
+    scope: u32,
+) -> DelegationRecord {
     validate_delegation_scope(env, scope);
 
     let record: DelegationRecord = env
@@ -3362,6 +7893,25 @@ fn require_delegation(env: &Env, grantor: &Address, delegate: &Address, scope: u
 
     if record.scope & scope != scope {
         panic_with_error!(env, RegistryError::DelegationScopeExceeded);
+    }
+
+    record
+}
+
+/// Bound a delegated registration's lifetime by the delegation that authorized
+/// it (#338).
+///
+/// A non-zero proof TTL is capped at the delegation's `expires_at`; an eternal
+/// proof (TTL `0`) becomes exactly the delegation's expiry instead of `0`. The
+/// delegation has already been checked live, so the result is strictly in the
+/// future and can never be zero. Direct, non-delegated registration is
+/// untouched.
+fn bounded_delegated_expiry(env: &Env, delegation_expires_at: u64) -> u64 {
+    let ttl_expiry = compute_expires_at(env);
+    if ttl_expiry == 0 {
+        delegation_expires_at
+    } else {
+        ttl_expiry.min(delegation_expires_at)
     }
 }
 
@@ -3454,11 +8004,68 @@ fn get_issuer_record(env: &Env, issuer: &Address) -> IssuerRecord {
         .unwrap_or_else(|| panic_with_error!(env, RegistryError::UnknownIssuer))
 }
 
+fn get_credential_root_record_opt(
+    env: &Env,
+    credential_root: &BytesN<32>,
+) -> Option<CredentialRootRecord> {
+    let key_v2 = DataKey::CredentialRootV2(credential_root.clone());
+    if let Some(record) = env.storage().persistent().get(&key_v2) {
+        return Some(record);
+    }
+    let key_v1 = DataKey::CredentialRoot(credential_root.clone());
+    if let Some(v1) = env.storage().persistent().get::<_, CredentialRootRecordV1>(&key_v1) {
+        return Some(CredentialRootRecord {
+            metadata_hash: v1.metadata_hash,
+            status: if v1.active { STATUS_REGISTERED } else { STATUS_REVOKED },
+            issued_at: v1.issued_at,
+            expires_at: 0,
+        });
+    }
+    None
+}
+
 fn get_credential_root_record(env: &Env, credential_root: &BytesN<32>) -> CredentialRootRecord {
+    get_credential_root_record_opt(env, credential_root)
+        .unwrap_or_else(|| panic_with_error!(env, RegistryError::UnknownCredentialRoot))
+}
+
+fn index_credential_root(env: &Env, root: &BytesN<32>) -> bool {
+    let indexed_key = DataKey::CredentialRootIndexed(root.clone());
+    if env.storage().persistent().has(&indexed_key) {
+        return false;
+    }
+    let seq_key = DataKey::CredentialRootSeq;
+    let seq: u32 = env.storage().persistent().get(&seq_key).unwrap_or(0);
+    let next_seq = seq.saturating_add(1);
     env.storage()
         .persistent()
-        .get(&DataKey::CredentialRoot(credential_root.clone()))
-        .unwrap_or_else(|| panic_with_error!(env, RegistryError::UnknownCredentialRoot))
+        .set(&DataKey::CredentialRootIndex(next_seq), root);
+    env.storage().persistent().set(&seq_key, &next_seq);
+    env.storage().persistent().set(&indexed_key, &next_seq);
+    true
+}
+
+fn backfill_credential_roots_step(env: &Env) {
+    let backfill_key = DataKey::CredentialRootsBackfillQueue;
+    let queue_opt: Option<SorobanVec<BytesN<32>>> = env
+        .storage()
+        .persistent()
+        .get(&backfill_key)
+        .or_else(|| env.storage().persistent().get(&DataKey::CredentialRootsBackfill));
+
+    if let Some(queue) = queue_opt {
+        let cursor_key = DataKey::CredentialRootsBackfillCursor;
+        let mut cursor: u32 = env.storage().persistent().get(&cursor_key).unwrap_or(0);
+        let total = queue.len();
+        let mut processed = 0u32;
+        while cursor < total && processed < MAX_ROOTS_BACKFILL_BATCH {
+            let root = queue.get(cursor).unwrap();
+            index_credential_root(env, &root);
+            cursor += 1;
+            processed += 1;
+        }
+        env.storage().persistent().set(&cursor_key, &cursor);
+    }
 }
 
 fn get_active_verifier(env: &Env) -> Address {
@@ -3483,11 +8090,77 @@ fn get_verifier_rotation_state(env: &Env) -> VerifierState {
         })
 }
 
+/// Build the ordered, fixed-size slot list for `list_verifiers`.
+///
+/// Returns exactly 3 entries in role order: [Active, Pending, Previous].
+/// Each entry is `None` if the corresponding slot is unpopulated.
+///
+/// The active slot is read from `DataKey::Verifier` (the canonical active
+/// address) first. If `DataKey::VerifierState` is present the pending and
+/// previous slots are taken from it. When the VerifierState carries an
+/// `active_verifier` that differs from `DataKey::Verifier` (e.g. mid-
+/// rotation) the `DataKey::Verifier` value is authoritative for the Active
+/// slot, matching the semantics of `get_verifier`.
+fn collect_verifier_slots(env: &Env) -> [Option<VerifierEntry>; 3] {
+    let active_addr: Option<Address> = env.storage().persistent().get(&DataKey::Verifier);
+
+    let state_opt: Option<VerifierState> =
+        env.storage().persistent().get(&DataKey::VerifierState);
+
+    let active_entry = active_addr.map(|addr| VerifierEntry {
+        address: addr,
+        role: VerifierRole::Active,
+    });
+
+    let (pending_entry, previous_entry) = match state_opt {
+        Some(state) => {
+            let pending = state.pending_verifier.map(|addr| VerifierEntry {
+                address: addr,
+                role: VerifierRole::Pending,
+            });
+            let previous = state.previous_verifier.map(|addr| VerifierEntry {
+                address: addr,
+                role: VerifierRole::Previous,
+            });
+            (pending, previous)
+        }
+        None => (None, None),
+    };
+
+    [active_entry, pending_entry, previous_entry]
+}
+
 fn require_active_credential_root(env: &Env, credential_root: &BytesN<32>) {
     let record = get_credential_root_record(env, credential_root);
-    if !record.active {
+    if record.status == STATUS_REVOKED {
         panic_with_error!(env, RegistryError::RevokedCredentialRoot);
     }
+    if record.status == STATUS_EXPIRED || (record.expires_at > 0 && env.ledger().timestamp() >= record.expires_at) {
+        panic_with_error!(env, RegistryError::ExpiredCredentialRoot);
+    }
+}
+
+fn append_lineage_child(env: &Env, parent: &BytesN<32>, child: &BytesN<32>) {
+    let seq_key = DataKey::LineageChildSeq(parent.clone());
+    let current: u32 = env.storage().persistent().get(&seq_key).unwrap_or(0);
+    if current >= MAX_LINEAGE_CHILDREN_PER_PARENT {
+        panic_with_error!(env, RegistryError::LineageChildrenSaturated);
+    }
+    let next = current + 1;
+    env.storage()
+        .persistent()
+        .set(&DataKey::LineageChild(parent.clone(), next), child);
+    env.storage().persistent().set(&seq_key, &next);
+}
+
+fn append_proof_dispute(env: &Env, proof_id: &BytesN<32>, dispute_id: &BytesN<32>) {
+    let seq_key = DataKey::ProofDisputeSeq(proof_id.clone());
+    let current: u32 = env.storage().persistent().get(&seq_key).unwrap_or(0);
+    let next = current + 1;
+    env.storage()
+        .persistent()
+        .set(&DataKey::ProofDispute(proof_id.clone(), next), dispute_id);
+    env.storage().persistent().set(&seq_key, &next);
 }
 
 fn save_record(
@@ -3577,9 +8250,134 @@ fn record_proof_history(
     .publish(env);
 }
 
+/// Append an institutional authority history entry for an approver.
+///
+/// Dual-indexed:
+/// 1. Sequential global sequence (`DataKey::AuthorityHistoryEntry(seq)`)
+/// 2. Sequential per-approver sequence (`DataKey::ApproverAuthorityHistoryEntry(approver, seq)`)
+///
+/// This avoids unbounded iteration through historical approvers during queries,
+/// enabling direct O(limit) pagination without scanning or filtering.
+fn record_authority_history(
+    env: &Env,
+    approver: &Address,
+    role: u32,
+    transition: u32,
+    actor: Option<Address>,
+    metadata_hash: Option<BytesN<32>>,
+) -> u32 {
+    let global_seq_key = DataKey::AuthorityHistorySeq;
+    let global_seq: u32 = env
+        .storage()
+        .persistent()
+        .get(&global_seq_key)
+        .unwrap_or(0);
+    let next_global_seq = global_seq
+        .checked_add(1)
+        .unwrap_or_else(|| panic_with_error!(env, RegistryError::HistorySaturated));
+
+    let approver_seq_key = DataKey::ApproverAuthorityHistorySeq(approver.clone());
+    let approver_seq: u32 = env
+        .storage()
+        .persistent()
+        .get(&approver_seq_key)
+        .unwrap_or(0);
+    let next_approver_seq = approver_seq
+        .checked_add(1)
+        .unwrap_or_else(|| panic_with_error!(env, RegistryError::HistorySaturated));
+
+    let now = env.ledger().timestamp();
+    let entry = AuthorityHistoryEntry {
+        reference: next_global_seq,
+        ledger_timestamp: now,
+        approver: approver.clone(),
+        role,
+        transition,
+        actor,
+        metadata_hash,
+    };
+
+    env.storage().persistent().set(
+        &DataKey::AuthorityHistoryEntry(next_global_seq),
+        &entry,
+    );
+    env.storage().persistent().set(&global_seq_key, &next_global_seq);
+
+    env.storage().persistent().set(
+        &DataKey::ApproverAuthorityHistoryEntry(approver.clone(), next_approver_seq),
+        &entry,
+    );
+    env.storage().persistent().set(&approver_seq_key, &next_approver_seq);
+
+    next_global_seq
+}
+
+fn require_timestamp_claim_actor(env: &Env, actor: &Address, proof: &ProofRecord) {
+    actor.require_auth();
+
+    let admin: Address = env
+        .storage()
+        .persistent()
+        .get(&DataKey::Admin)
+        .unwrap_or_else(|| panic_with_error!(env, RegistryError::NotInitialized));
+    if actor == &admin {
+        return;
+    }
+    if let Some(ref source) = proof.source {
+        if actor == source {
+            return;
+        }
+    }
+    if let Some(ref issuer) = proof.issuer {
+        if actor == issuer {
+            return;
+        }
+    }
+    panic_with_error!(env, RegistryError::UnauthorizedTimestampActor);
+}
+
+fn compute_timestamp_assurance(sources: u32) -> u32 {
+    let independent = (sources & (TIMESTAMP_SOURCE_STELLAR | TIMESTAMP_SOURCE_RFC3161)) != 0;
+    if independent {
+        return TIMESTAMP_ASSURANCE_INDEPENDENT;
+    }
+    if (sources & TIMESTAMP_SOURCE_CLAIMED) != 0 {
+        return TIMESTAMP_ASSURANCE_CLAIMED;
+    }
+    TIMESTAMP_ASSURANCE_NONE
+}
+
 /// Validate a lineage edge set: bounded fan-out and depth, no self-reference,
 /// and every parent must already be a known proof or lineage record.
+/// Validate a lineage edge set: non-empty, bounded fan-out and depth, no
+/// self-reference, and every parent must already be a usable proof or lineage
+/// record (proofs must not be revoked/expired).
 
+/// Derivatives already recorded against `parent` (#333).
+fn lineage_child_count(env: &Env, parent: &BytesN<32>) -> u32 {
+    env.storage()
+        .persistent()
+        .get(&DataKey::LineageChildCount(parent.clone()))
+        .unwrap_or(0u32)
+}
+
+/// Validate a lineage edge set and return the depth it implies (#333).
+///
+/// Every bound is checked before anything is written, so a rejected edge never
+/// leaves a parent charged for a derivative that was not recorded:
+///
+/// - The parent set is non-empty (`LineageEmptyParents`), at most
+///   `MAX_LINEAGE_FANOUT` long (in-degree), and contains no repeated digest, so
+///   the cap counts distinct edges rather than duplicate entries.
+/// - The output digest is not one of its own parents, and every parent is
+///   already a known proof or lineage record, so an edge can only ever point at
+///   evidence that exists. A proof parent must still be usable: a revoked or
+///   expired proof cannot anchor a derivative (`LineageParentUnavailable`).
+/// - The depth derived from the parents is within `MAX_LINEAGE_DEPTH` and equal
+///   to `claimed_depth`, so a caller cannot claim a shallow position to slip
+///   past the cap (`LineageDepthMismatch`).
+/// - Every parent still has out-degree budget left under `MAX_LINEAGE_FANOUT`
+///   (`LineageFanOutSaturated`).
 fn require_supported_metadata_envelope_version(env: &Env, version: u32) {
     if version < METADATA_ENVELOPE_V1 || version > METADATA_ENVELOPE_VERSION_MAX {
         panic_with_error!(env, RegistryError::UnsupportedMetadataEnvelopeVersion);
@@ -3632,6 +8430,7 @@ fn stamp_default_metadata_envelope(env: &Env, proof_id: &BytesN<32>, metadata_ha
     };
     env.storage().persistent().set(&key, &envelope);
     MetadataEnvelopeBound {
+        bound: Symbol::new(&env, "bound"),
         proof_id: proof_id.clone(),
         version: METADATA_ENVELOPE_VERSION_DEFAULT,
         metadata_hash: envelope.metadata_hash.clone(),
@@ -3639,30 +8438,179 @@ fn stamp_default_metadata_envelope(env: &Env, proof_id: &BytesN<32>, metadata_ha
     }
     .publish(env);
 }
-
 fn validate_lineage(
     env: &Env,
-    parent_proof_ids: &SorobanVec<BytesN<32>>,
+    parent_proof_ids: &Vec<BytesN<32>>,
     output_digest: &BytesN<32>,
-    depth: u32,
-) {
-    if parent_proof_ids.len() > MAX_LINEAGE_FANOUT as u32 {
+    claimed_depth: u32,
+) -> u32 {
+    let parent_count = parent_proof_ids.len();
+
+    // A derivative with no parents is a registration, not a lineage edge.
+    if parent_count == 0 {
+        panic_with_error!(env, RegistryError::LineageEmptyParents);
+    }
+    if parent_count > MAX_LINEAGE_FANOUT {
         panic_with_error!(env, RegistryError::LineageFanOutExceeded);
     }
-    if depth > MAX_LINEAGE_DEPTH {
-        panic_with_error!(env, RegistryError::LineageTooDeep);
-    }
 
-    for parent in parent_proof_ids.iter() {
+    let mut max_parent_depth: u32 = 0;
+    for cursor in 0..parent_count {
+        let parent = parent_proof_ids.get(cursor).unwrap();
+        for earlier in 0..cursor {
+            if parent_proof_ids.get(earlier).unwrap() == parent {
+                panic_with_error!(env, RegistryError::InvalidLineage);
+            }
+        }
+
         if parent == *output_digest {
             panic_with_error!(env, RegistryError::LineageCycle);
         }
-        let is_known_parent = env.storage().persistent().has(&DataKey::Proof(parent.clone()))
-            || env.storage().persistent().has(&DataKey::Lineage(parent.clone()));
-        if !is_known_parent {
-            panic_with_error!(env, RegistryError::InvalidLineage);
+        if check_lineage_cycle(env, &parent, output_digest) {
+            panic_with_error!(env, RegistryError::LineageCycle);
+        }
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::Proof(parent.clone()))
+        {
+            let status = HarpocratesRegistry::get_proof_status(env.clone(), parent.clone());
+            if status != ProofVerificationStatus::Valid {
+                panic_with_error!(env, RegistryError::LineageParentUnavailable);
+            }
+            continue;
+        }
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::Lineage(parent.clone()))
+        {
+            let lineage: LineageRecord = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Lineage(parent.clone()))
+                .unwrap();
+            max_parent_depth = max_parent_depth.max(lineage.depth);
+            continue;
+        }
+        panic_with_error!(env, RegistryError::InvalidLineage);
+    }
+
+    let derived_depth = max_parent_depth.saturating_add(1);
+    if derived_depth > MAX_LINEAGE_DEPTH {
+        panic_with_error!(env, RegistryError::LineageTooDeep);
+    }
+    if claimed_depth != derived_depth {
+        panic_with_error!(env, RegistryError::LineageDepthMismatch);
+    }
+
+    // Charge every parent's out-degree budget. Budgets are read before any is
+    // written so a saturated parent cannot leave the earlier parents charged.
+    for parent in parent_proof_ids.iter() {
+        if lineage_child_count(env, &parent) >= MAX_LINEAGE_FANOUT {
+            panic_with_error!(env, RegistryError::LineageFanOutSaturated);
         }
     }
+    for parent in parent_proof_ids.iter() {
+        let key = DataKey::LineageChildCount(parent.clone());
+        let used = lineage_child_count(env, &parent);
+        env.storage().persistent().set(&key, &(used + 1));
+    }
+
+    derived_depth
+}
+
+/// Derive the domain-separated parent content commitment (#332).
+///
+/// `SHA-256("harp_lin_pc" ‖ binding_a ‖ binding_b)` — opaque, reproducible,
+/// and free of private media / witness material.
+fn derive_lineage_parent_commitment(
+    env: &Env,
+    binding_a: &BytesN<32>,
+    binding_b: &BytesN<32>,
+) -> BytesN<32> {
+    const PREFIX: [u8; 11] = *b"harp_lin_pc";
+    let mut pre_image = [0u8; 75];
+    pre_image[..11].copy_from_slice(&PREFIX);
+    pre_image[11..43].copy_from_slice(&binding_a.to_array());
+    pre_image[43..75].copy_from_slice(&binding_b.to_array());
+    let pre_image_bytes = Bytes::from_array(env, &pre_image);
+    env.crypto().sha256(&pre_image_bytes).into()
+}
+
+/// Build the parallel parent-commitment vector for a validated parent set.
+fn collect_lineage_parent_commitments(
+    env: &Env,
+    parent_proof_ids: &SorobanVec<BytesN<32>>,
+) -> SorobanVec<BytesN<32>> {
+    let mut commitments = SorobanVec::new(env);
+    for parent in parent_proof_ids.iter() {
+        if let Some(proof) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, ProofRecord>(&DataKey::Proof(parent.clone()))
+        {
+            commitments.push_back(derive_lineage_parent_commitment(
+                env,
+                &proof.video_hash,
+                &proof.metadata_hash,
+            ));
+            continue;
+        }
+        if let Some(lineage) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, LineageRecord>(&DataKey::Lineage(parent.clone()))
+        {
+            commitments.push_back(derive_lineage_parent_commitment(
+                env,
+                &lineage.manifest_digest,
+                &lineage.output_digest,
+            ));
+            continue;
+        }
+        panic_with_error!(env, RegistryError::InvalidLineage);
+    }
+
+    commitments
+}
+
+fn check_lineage_cycle(env: &Env, proof_id: &BytesN<32>, target: &BytesN<32>) -> bool {
+    let mut visited = SorobanVec::new(env);
+    check_lineage_cycle_internal(env, proof_id, target, &mut visited, 1)
+}
+
+fn check_lineage_cycle_internal(
+    env: &Env,
+    proof_id: &BytesN<32>,
+    target: &BytesN<32>,
+    visited: &mut SorobanVec<BytesN<32>>,
+    depth: u32,
+) -> bool {
+    if depth > MAX_LINEAGE_DEPTH {
+        return false;
+    }
+
+    if visited.iter().any(|v| v == *proof_id) {
+        return false;
+    }
+    visited.push_back(proof_id.clone());
+
+    if *proof_id == *target {
+        return true;
+    }
+
+    let lineage_key = DataKey::Lineage(proof_id.clone());
+    if env.storage().persistent().has(&lineage_key) {
+        let lineage: LineageRecord = env.storage().persistent().get(&lineage_key).unwrap();
+        for parent in lineage.parent_proof_ids.iter() {
+            if check_lineage_cycle_internal(env, &parent, target, visited, depth + 1) {
+                return true;
+            }
+        }
+    }
+
+    false
 }
 
 /// Derive the deterministic sub-proof_id for batch element `index`.
@@ -3714,17 +8662,6 @@ pub(crate) fn expected_domain_tag(env: &Env) -> BytesN<32> {
     env.crypto().sha256(&preimage).into()
 }
 
-/// Read a 128-byte public-input frame out of `Bytes`, rejecting any other
-/// length before allocating.
-fn read_public_input_frame(env: &Env, public_inputs: &Bytes) -> [u8; PUBLIC_INPUTS_LEN] {
-    if public_inputs.len() as usize != PUBLIC_INPUTS_LEN {
-        panic_with_error!(env, RegistryError::InvalidPublicInputs);
-    }
-    let mut frame = [0u8; PUBLIC_INPUTS_LEN];
-    public_inputs.copy_into_slice(&mut frame);
-    frame
-}
-
 /// Parse the legacy (v1-lenient) silent-witness layout.
 ///
 /// Behaviour is unchanged from the pre-codec implementation: only the frame
@@ -3761,6 +8698,48 @@ fn parse_silent_witness_public_inputs(env: &Env, public_inputs: &Bytes) -> Silen
     }
 }
 
+struct BrowserSilentWitnessInputs {
+    video_hash: BytesN<32>,
+    credential_root: BytesN<32>,
+    nullifier: BytesN<32>,
+}
+
+/// Parse the 128-byte public-input blob produced by the browser silent_witness Noir circuit
+/// (frontend/public/noir/silent_witness.json).
+///
+/// Layout (4 x BN254 field elements, 32 bytes each):
+///   [ 0.. 32)  video_hash_hi (low 16 bytes)
+///   [32.. 64)  video_hash_lo (low 16 bytes)
+///   [64.. 96)  credential_root
+///   [96..128)  nullifier
+fn parse_browser_silent_witness_public_inputs(
+    env: &Env,
+    public_inputs: &Bytes,
+) -> BrowserSilentWitnessInputs {
+    if public_inputs.len() != SILENT_WITNESS_BROWSER_V1_INPUT_LEN {
+        panic_with_error!(env, RegistryError::InvalidPublicInputs);
+    }
+    let mut frame = [0u8; 128];
+    public_inputs.copy_into_slice(&mut frame);
+
+    let mut video_hash = [0u8; 32];
+    video_hash[..16].copy_from_slice(&frame[16..32]);
+    video_hash[16..].copy_from_slice(&frame[48..64]);
+
+    let mut credential_root = [0u8; 32];
+    credential_root.copy_from_slice(&frame[64..96]);
+
+    let mut nullifier = [0u8; 32];
+    nullifier.copy_from_slice(&frame[96..128]);
+
+    BrowserSilentWitnessInputs {
+        video_hash: BytesN::from_array(env, &video_hash),
+        credential_root: BytesN::from_array(env, &credential_root),
+        nullifier: BytesN::from_array(env, &nullifier),
+    }
+}
+
+
 // ---------------------------------------------------------------------------
 // Silent Witness v2 (scoped) public input parsing
 // ---------------------------------------------------------------------------
@@ -3774,27 +8753,33 @@ struct ScopedSilentWitnessInputs {
     domain_tag: BytesN<32>,
 }
 
-/// Parse the 224-byte public-input blob produced by the v2 scoped
-/// silent_witness Noir circuit.
+/// Parse the public-input blob produced by the v2 scoped silent_witness Noir
+/// circuit: the 256-byte envelope carrying the circuit-version trailer (#368).
 ///
-/// Layout (7 x BN254 field elements, 32 bytes each):
-///   [  0.. 32)  video_hash_hi + video_hash_lo (packed)
-///   [ 32.. 64)  video_hash_lo continued
-///   [ 64.. 96)  credential_root
-///   [ 96..128)  nullifier
-///   [128..160)  verifier_scope
-///   [160..192)  epoch
-///   [192..224)  domain_tag
+/// The envelope appends a 32-byte `circuit_version` field that the producing
+/// circuit asserted in-circuit, so the proof names its own circuit; it must
+/// decode to [`verifier_inputs::EXPECTED_CIRCUIT_VERSION`] or the registration
+/// is rejected with [`RegistryError::CircuitVersionMismatch`]. The superseded
+/// bare 224-byte frame is rejected at the dispatch in
+/// [`HarpocratesRegistry::register_anonymous_verified`] before this parser runs,
+/// so no proof can skip the version commitment.
 fn parse_scoped_silent_witness_public_inputs(
     env: &Env,
     public_inputs: &Bytes,
 ) -> ScopedSilentWitnessInputs {
-    if public_inputs.len() != SILENT_WITNESS_V2_INPUT_LEN {
+    let input_len = public_inputs.len();
+    if input_len != SILENT_WITNESS_V2_ENVELOPED_INPUT_LEN {
         panic_with_error!(env, RegistryError::InvalidPublicInputs);
     }
 
-    let mut bytes = [0u8; 224];
+    let mut bytes = [0u8; verifier_inputs::SILENT_WITNESS_V2_PUBLIC_INPUTS_LEN];
     public_inputs.copy_into_slice(&mut bytes);
+
+    let mut trailer = [0u8; verifier_inputs::FIELD_LEN];
+    trailer.copy_from_slice(&bytes[CIRCUIT_VERSION_TRAILER_OFFSET..]);
+    if verifier_inputs::circuit_version_of(&trailer) != verifier_inputs::EXPECTED_CIRCUIT_VERSION {
+        panic_with_error!(env, RegistryError::CircuitVersionMismatch);
+    }
 
     // Reassemble video_hash: hi occupies bytes 16..32 of the first field word,
     // lo occupies bytes 48..64 of the second field word (UltraHonk packs 128-bit
@@ -3854,14 +8839,90 @@ fn get_scope_epoch_raw(env: &Env, scope: &BytesN<32>) -> u64 {
         .unwrap_or(DEFAULT_SCOPE_EPOCH)
 }
 
-fn verify_external_proof(env: &Env, verifier: &Address, public_inputs: Bytes, proof: Bytes) {
+fn verify_external_proof(
+    env: &Env,
+    verifier: &Address,
+    public_inputs: Bytes,
+    proof: Bytes,
+) -> bool {
     let mut args: SorobanVec<Val> = SorobanVec::new(env);
     args.push_back(public_inputs.into_val(env));
     args.push_back(proof.into_val(env));
 
-    match env.try_invoke_contract::<(), InvokeError>(verifier, &Symbol::new(env, "verify_proof"), args) {
+    match env.try_invoke_contract::<(), InvokeError>(
+        verifier,
+        &Symbol::new(env, "verify_proof"),
+        args,
+    ) {
         Ok(Ok(_)) => true,
         _ => false,
+    }
+}
+
+/// The active verifier's declared circuit-version window, defaulting to the
+/// full built-in range so an undeclared window preserves pre-#343 behaviour.
+fn get_verifier_circuit_versions_raw(env: &Env) -> (u32, u32) {
+    match env
+        .storage()
+        .persistent()
+        .get::<DataKey, VerifierCircuitVersions>(&DataKey::VerifierCircuitVersions)
+    {
+        Some(record) => (record.min_version, record.max_version),
+        None => (MIN_SUPPORTED_CIRCUIT_VERSION, MAX_SUPPORTED_CIRCUIT_VERSION),
+    }
+}
+
+/// Validate `circuit_version` against both authorities: this wasm build's own
+/// framable range and the configured verifier's declared window.
+///
+/// Fails closed with the stable `UnsupportedCircuitVersion` code, and is always
+/// called before the external verifier so an unsupported version never leaves
+/// the contract.
+fn require_supported_circuit_version(env: &Env, circuit_version: u32) {
+    if circuit_version < MIN_SUPPORTED_CIRCUIT_VERSION
+        || circuit_version > MAX_SUPPORTED_CIRCUIT_VERSION
+    {
+        panic_with_error!(env, RegistryError::UnsupportedCircuitVersion);
+    }
+
+    let (min_version, max_version) = get_verifier_circuit_versions_raw(env);
+    if circuit_version < min_version || circuit_version > max_version {
+        panic_with_error!(env, RegistryError::UnsupportedCircuitVersion);
+    }
+}
+
+/// Enforce the active verifier's verdict, gated on the verifier's declared
+/// circuit-version window (#343).
+///
+/// `circuit_version` is the version implied by the caller's frame layout (or,
+/// for selective disclosure, carried in the frame). It is validated at the
+/// trust boundary *before* the verifier is invoked, so an unsupported version
+/// fails closed with the stable `UnsupportedCircuitVersion` code instead of
+/// reaching a dependency that cannot answer it.
+///
+/// The verdict itself fails closed with the stable `InvalidProof` code when the
+/// active verifier rejects the proof or the call itself fails (dependency
+/// failure). Only the active verifier decides: once a rotation is activated the
+/// replacement is enforced immediately, so a proof minted for the outgoing
+/// circuit is not carried across the swap.
+///
+/// Every verified entry point funnels through here so the trust boundary
+/// behaves identically.
+fn require_verified_proof(
+    env: &Env,
+    active: &Address,
+    circuit_version: u32,
+    public_inputs: Bytes,
+    proof: Bytes,
+) {
+    require_supported_circuit_version(env, circuit_version);
+
+    if proof.is_empty() {
+        panic_with_error!(env, RegistryError::InvalidProof);
+    }
+
+    if !verify_external_proof(env, active, public_inputs, proof) {
+        panic_with_error!(env, RegistryError::InvalidProof);
     }
 }
 
@@ -3881,7 +8942,13 @@ struct RevocationPublicInputs {
 ///   [ 64.. 96)  domain_separator
 ///   [ 96..128)  credential_root
 fn parse_revocation_public_inputs(env: &Env, public_inputs: &Bytes) -> RevocationPublicInputs {
-    let frame = read_public_input_frame(env, public_inputs);
+    // Revocation frames are 4 × 32-byte fields (128 bytes), not the 160-byte
+    // silent-witness length.
+    if public_inputs.len() as usize != REVOCATION_PUBLIC_INPUTS_LEN {
+        panic_with_error!(env, RegistryError::InvalidPublicInputs);
+    }
+    let mut frame = [0u8; REVOCATION_PUBLIC_INPUTS_LEN];
+    public_inputs.copy_into_slice(&mut frame);
 
     let mut revocation_root = [0u8; 32];
     revocation_root.copy_from_slice(&frame[0..32]);
@@ -3905,9 +8972,10 @@ fn parse_revocation_public_inputs(env: &Env, public_inputs: &Bytes) -> Revocatio
 
 /// Parsed element of an aggregated batch proof.
 ///
-/// NOTE: This struct derives `Copy` so it can be used with `[value; N]`
-/// array initialization syntax in the parsing function below.
-#[derive(Clone, Copy)]
+/// NOTE: `BytesN` does not implement `Copy`, so the parsing function below
+/// initializes the element array with `core::array::from_fn` instead of
+/// `[value; N]` repetition.
+#[derive(Clone)]
 struct AggregatedBatchElement {
     video_hash: BytesN<32>,
     credential_root: BytesN<32>,
@@ -3950,19 +9018,18 @@ fn parse_aggregated_public_inputs(
     // Parse domain separator from the first 32 bytes (small stack buffer).
     // NOTE: We must slice first because Bytes.copy_into_slice expects the
     // destination to match the full Bytes length.
-    let domain_slice = public_inputs.slice(0, 32);
+    let domain_slice = public_inputs.slice(0..32);
     let mut domain_bytes = [0u8; 32];
     domain_slice.copy_into_slice(&mut domain_bytes);
     let domain_separator = BytesN::from_array(env, &domain_bytes);
 
-    // Initialize default elements.  Since AggregatedBatchElement is Copy we
-    // can use the `[value; N]` syntax safely.
-    let default_element = AggregatedBatchElement {
+    // Initialize default elements.  `BytesN` is not `Copy`, so build each
+    // slot with `core::array::from_fn` instead of `[value; N]` repetition.
+    let mut elements = core::array::from_fn(|_| AggregatedBatchElement {
         video_hash: BytesN::from_array(env, &[0u8; 32]),
         credential_root: BytesN::from_array(env, &[0u8; 32]),
         nullifier: BytesN::from_array(env, &[0u8; 32]),
-    };
-    let mut elements = [default_element; MAX_AGGREGATION_SIZE as usize];
+    });
 
     // Parse each batch element using a small 128-byte temp buffer.
     // We slice the Bytes at the element offset to avoid allocating a full
@@ -3970,7 +9037,7 @@ fn parse_aggregated_public_inputs(
     let mut element_bytes = [0u8; 128];
     for i in 0..batch_size {
         let element_start = 32 + (i * 128);
-        let element_slice = public_inputs.slice(element_start, element_start + 128);
+        let element_slice = public_inputs.slice(element_start..element_start + 128);
         element_slice.copy_into_slice(&mut element_bytes);
 
         // Reconstruct video hash from the two limbs (same as silent witness parsing).
@@ -4024,6 +9091,25 @@ fn decrement_open_dispute_count(env: &Env, proof_id: &BytesN<32>) {
         env.storage().persistent().remove(&key);
     } else {
         env.storage().persistent().set(&key, &new_count);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, BUMP_THRESHOLD_LEDGERS, BUMP_TARGET_LEDGERS);
+    }
+}
+
+/// Decrement the per-reporter open-dispute counter. Saturates at 0 and
+/// removes the key when it reaches zero so idle reporters hold no storage.
+fn decrement_reporter_open_dispute_count(env: &Env, reporter: &Address) {
+    let key = DataKey::ReporterOpenDisputeCount(reporter.clone());
+    let count: u32 = env.storage().persistent().get(&key).unwrap_or(0u32);
+    let new_count = count.saturating_sub(1);
+    if new_count == 0 {
+        env.storage().persistent().remove(&key);
+    } else {
+        env.storage().persistent().set(&key, &new_count);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, BUMP_THRESHOLD_LEDGERS, BUMP_TARGET_LEDGERS);
     }
 }
 
@@ -4098,10 +9184,12 @@ fn supersession_reverse_key(env: &Env, superseding_proof_id: &BytesN<32>) -> Byt
     // Build a 44-byte pre-image: [PREFIX (12)] ‖ [superseding_proof_id (32)]
     let mut pre_image = [0u8; 44];
     pre_image[..12].copy_from_slice(&PREFIX);
-    superseding_proof_id.copy_into_slice(&mut pre_image[12..]);
+    let mut proof_id_bytes = [0u8; 32];
+    superseding_proof_id.copy_into_slice(&mut proof_id_bytes);
+    pre_image[12..].copy_from_slice(&proof_id_bytes);
 
     let pre_image_bytes = Bytes::from_array(env, &pre_image);
-    env.crypto().sha256(&pre_image_bytes)
+    env.crypto().sha256(&pre_image_bytes).into()
 }
 
 // ---------------------------------------------------------------------------
@@ -4109,58 +9197,374 @@ fn supersession_reverse_key(env: &Env, superseding_proof_id: &BytesN<32>) -> Byt
 // ---------------------------------------------------------------------------
 
 fn get_timelock_min_delay(env: &Env) -> u64 {
-    env.storage().persistent().get(&DataKey::TimelockMinDelay)
+    env.storage()
+        .persistent()
+        .get(&DataKey::TimelockMinDelay)
         .unwrap_or(DEFAULT_TIMELOCK_MIN_DELAY_SECS)
 }
 
 fn get_timelock_proposal_or_panic(env: &Env, proposal_id: u32) -> TimelockProposal {
-    env.storage().persistent().get(&DataKey::Proposal(proposal_id))
+    env.storage()
+        .persistent()
+        .get(&DataKey::Proposal(proposal_id))
         .unwrap_or_else(|| panic_with_error!(env, RegistryError::ProposalNotFound))
 }
 
 fn next_proposal_id(env: &Env) -> u32 {
-    let current: u32 = env.storage().persistent().get(&DataKey::ProposalSeq).unwrap_or(0u32);
+    let current: u32 = env
+        .storage()
+        .persistent()
+        .get(&DataKey::ProposalSeq)
+        .unwrap_or(0u32);
     let next = current.saturating_add(1);
     env.storage().persistent().set(&DataKey::ProposalSeq, &next);
     next
 }
 
 fn count_pending_proposals(env: &Env) -> u32 {
-    let count: u32 = env.storage().persistent().get(&DataKey::ProposalSeq).unwrap_or(0u32);
-    if count == 0 { return 0; }
+    let count: u32 = env
+        .storage()
+        .persistent()
+        .get(&DataKey::ProposalSeq)
+        .unwrap_or(0u32);
+    if count == 0 {
+        return 0;
+    }
     let mut pending = 0u32;
     for pid in 1..=count {
-        if let Some(proposal) = env.storage().persistent().get::<DataKey, TimelockProposal>(&DataKey::Proposal(pid)) {
-            if !proposal.executed && !proposal.cancelled { pending += 1; }
+        if let Some(proposal) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, TimelockProposal>(&DataKey::Proposal(pid))
+        {
+            if !proposal.executed && !proposal.cancelled {
+                pending += 1;
+            }
         }
     }
     pending
 }
 
+
+// ---------------------------------------------------------------------------
+// Role-change intent digest (#1184)
+// ---------------------------------------------------------------------------
+//
+// A queued privileged transition binds its approved (action, target, payload)
+// tuple with an intent digest computed at propose time and stored alongside
+// the proposal. Execute paths recompute the digest from the freshly loaded
+// proposal and reject any mismatch before dispatch, so a substituted target
+// role cannot be applied. Council and timelock use distinct domains so a
+// council intent cannot be replayed as a timelock intent.
+
+const COUNCIL_INTENT_DOMAIN: &[u8] = b"harpocrates.council.intent.v1";
+const TIMELOCK_INTENT_DOMAIN: &[u8] = b"harpocrates.timelock.intent.v1";
+
+fn intent_digest(
+    env: &Env,
+    domain: &[u8],
+    action: u32,
+    target: &Address,
+    payload: &BytesN<32>,
+) -> BytesN<32> {
+    let mut pre = Bytes::new(env);
+    pre.extend_from_slice(domain);
+    pre.extend_from_slice(&action.to_be_bytes());
+    let target_xdr = target.clone().to_xdr(env);
+    pre.append(&target_xdr);
+    pre.append(payload);
+    env.crypto().sha256(&pre).into()
+}
+
 fn dispatch_timelocked_action(env: &Env, proposal: &TimelockProposal) {
     match proposal.action {
         1 => {
-            env.storage().persistent().set(&DataKey::Verifier, &proposal.target);
+            env.storage()
+                .persistent()
+                .set(&DataKey::Verifier, &proposal.target);
             env.storage().persistent().remove(&DataKey::VerifierState);
-            VerifierSet { verifier: proposal.target.clone() }.publish(env);
+            VerifierSet {
+                verifier: proposal.target.clone(),
+            }
+            .publish(env);
         }
         2 => {
             let mut record = get_issuer_record(env, &proposal.target);
             record.active = false;
-            env.storage().persistent().set(&DataKey::Issuer(proposal.target.clone()), &record);
-            IssuerRevoked { issuer: proposal.target.clone() }.publish(env);
+            env.storage()
+                .persistent()
+                .set(&DataKey::Issuer(proposal.target.clone()), &record);
+            // A timelocked revocation clears any rotation grace record too: the
+            // two retirements must never contradict each other (#323).
+            env.storage()
+                .persistent()
+                .remove(&DataKey::IssuerRotation(proposal.target.clone()));
+            IssuerRevoked {
+                issuer: proposal.target.clone(),
+            }
+            .publish(env);
+            record_authority_history(
+                env,
+                &proposal.target,
+                ROLE_ISSUER,
+                TRANSITION_REVOKED,
+                Some(proposal.proposer.clone()),
+                Some(record.metadata_hash),
+            );
         }
         3 => {
+            // `payload` is 32 bytes; the TTL is stored big-endian in the
+            // first 8 bytes (see `ttl_payload` in test_timelock.rs).
+            let mut payload_bytes = [0u8; 32];
+            proposal.payload.copy_into_slice(&mut payload_bytes);
             let mut ttl_bytes = [0u8; 8];
-            proposal.payload.copy_into_slice(&mut ttl_bytes);
+            ttl_bytes.copy_from_slice(&payload_bytes[..8]);
             let ttl_secs = u64::from_be_bytes(ttl_bytes);
-            env.storage().persistent().set(&DataKey::ProofTtl, &ttl_secs);
+            env.storage()
+                .persistent()
+                .set(&DataKey::ProofTtl, &ttl_secs);
         }
         4 => {
             let mut record = get_credential_root_record(env, &proposal.payload);
+            record.status = STATUS_REVOKED;
+            env.storage()
+                .persistent()
+                .set(&DataKey::CredentialRootV2(proposal.payload.clone()), &record);
+            CredentialRootRevoked {
+                credential_root: proposal.payload.clone(),
+            }
+            .publish(env);
+        }
+        5 => {
+            let mut record = get_credential_root_record(env, &proposal.payload);
+            record.status = STATUS_EXPIRED;
+            record.expires_at = env.ledger().timestamp();
+            env.storage()
+                .persistent()
+                .set(&DataKey::CredentialRootV2(proposal.payload.clone()), &record);
+            CredentialRootExpired {
+                credential_root: proposal.payload.clone(),
+                expired_at: record.expires_at,
+            }
+            .publish(env);
+        }
+        6 => {
+            let old_wasm_hash = env
+                .storage()
+                .persistent()
+                .get(&DataKey::WasmHash)
+                .unwrap_or_else(|| BytesN::from_array(env, &[0u8; 32]));
+            let new_wasm_hash = proposal.payload.clone();
+            env.deployer()
+                .update_current_contract_wasm(new_wasm_hash.clone());
+            env.storage()
+                .persistent()
+                .set(&DataKey::WasmHash, &new_wasm_hash);
+            ContractUpgraded {
+                old_wasm_hash,
+                new_wasm_hash,
+            }
+            .publish(env);
+        }
+        _ => panic_with_error!(env, RegistryError::InvalidProposalAction),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Admin Council helpers
+// ---------------------------------------------------------------------------
+
+fn get_admin_council_record(env: &Env) -> Option<AdminCouncil> {
+    env.storage().persistent().get(&DataKey::AdminCouncil)
+}
+
+fn is_council_active(env: &Env) -> bool {
+    match get_admin_council_record(env) {
+        Some(council) => env.ledger().timestamp() >= council.effective_at,
+        None => false,
+    }
+}
+
+fn next_council_proposal_id(env: &Env) -> u32 {
+    let current: u32 = env
+        .storage()
+        .persistent()
+        .get(&DataKey::CouncilProposalSeq)
+        .unwrap_or(0u32);
+    let next = current.saturating_add(1);
+    env.storage()
+        .persistent()
+        .set(&DataKey::CouncilProposalSeq, &next);
+    next
+}
+
+fn get_council_proposal_or_panic(env: &Env, proposal_id: u32) -> CouncilProposal {
+    env.storage()
+        .persistent()
+        .get(&DataKey::CouncilProposal(proposal_id))
+        .unwrap_or_else(|| panic_with_error!(env, RegistryError::ProposalNotFound))
+}
+
+fn dispatch_council_action(env: &Env, proposal: &CouncilProposal) {
+    match proposal.action {
+        1 => {
+            // SetVerifier
+            env.storage()
+                .persistent()
+                .set(&DataKey::Verifier, &proposal.target);
+            env.storage().persistent().remove(&DataKey::VerifierState);
+            env.storage()
+                .persistent()
+                .remove(&DataKey::VerifierCircuitVersions);
+            VerifierSet {
+                verifier: proposal.target.clone(),
+            }
+            .publish(env);
+        }
+        2 => {
+            // RevokeIssuer
+            let mut record = get_issuer_record(env, &proposal.target);
             record.active = false;
-            env.storage().persistent().set(&DataKey::CredentialRoot(proposal.payload.clone()), &record);
-            CredentialRootRevoked { credential_root: proposal.payload.clone() }.publish(env);
+            env.storage()
+                .persistent()
+                .set(&DataKey::Issuer(proposal.target.clone()), &record);
+            env.storage()
+                .persistent()
+                .remove(&DataKey::IssuerRotation(proposal.target.clone()));
+            IssuerRevoked {
+                issuer: proposal.target.clone(),
+            }
+            .publish(env);
+            record_authority_history(
+                env,
+                &proposal.target,
+                ROLE_ISSUER,
+                TRANSITION_REVOKED,
+                Some(proposal.proposer.clone()),
+                Some(record.metadata_hash),
+            );
+        }
+        3 => {
+            // UpgradeStorage
+            let had_version = env.storage().persistent().has(&DataKey::SchemaVersion);
+            let current_version: u32 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::SchemaVersion)
+                .unwrap_or(SchemaVersion::V1 as u32);
+            let target_version = SchemaVersion::V2 as u32;
+
+            if !had_version {
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::SchemaVersion, &(SchemaVersion::V1 as u32));
+            }
+            let actual_current = if !had_version {
+                SchemaVersion::V1 as u32
+            } else {
+                current_version
+            };
+            if actual_current < target_version {
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::SchemaVersion, &target_version);
+                SchemaUpgraded {
+                    previous: actual_current,
+                    current: target_version,
+                }
+                .publish(env);
+            }
+        }
+        4 => {
+            // SetRevocationRoot
+            env.storage()
+                .persistent()
+                .set(&DataKey::RevocationRoot, &proposal.payload);
+            RevocationRootSet {
+                revocation_root: proposal.payload.clone(),
+            }
+            .publish(env);
+        }
+        5 => {
+            // ScheduleVerifierRotation
+            let active_verifier = get_active_verifier(env);
+            let state = VerifierState {
+                active_verifier: Some(active_verifier.clone()),
+                pending_verifier: Some(proposal.target.clone()),
+                previous_verifier: Some(active_verifier.clone()),
+                activation_ledger: 0,
+                overlap_window: 0,
+                rollback_window: 0,
+                rollback_window_end: 0,
+            };
+            env.storage()
+                .persistent()
+                .set(&DataKey::VerifierState, &state);
+            VerifierRotationScheduled {
+                active_verifier: active_verifier.clone(),
+                pending_verifier: proposal.target.clone(),
+                activation_ledger: 0,
+                overlap_window: 0,
+                rollback_window: 0,
+            }
+            .publish(env);
+        }
+        6 => {
+            // ActivateVerifierRotation
+            let mut state = get_verifier_rotation_state(env);
+            let pending_verifier = state
+                .pending_verifier
+                .clone()
+                .unwrap_or_else(|| panic_with_error!(env, RegistryError::RotationNotScheduled));
+            let active_verifier = state
+                .active_verifier
+                .clone()
+                .unwrap_or_else(|| panic_with_error!(env, RegistryError::RotationNotScheduled));
+            let current_ledger = u64::from(env.ledger().sequence());
+
+            state.active_verifier = Some(pending_verifier.clone());
+            state.pending_verifier = None;
+            state.rollback_window_end = current_ledger.saturating_add(state.rollback_window.max(0));
+            env.storage()
+                .persistent()
+                .set(&DataKey::VerifierState, &state);
+            env.storage()
+                .persistent()
+                .set(&DataKey::Verifier, &pending_verifier);
+            env.storage()
+                .persistent()
+                .remove(&DataKey::VerifierCircuitVersions);
+            VerifierRotationActivated {
+                active_verifier: pending_verifier,
+                previous_verifier: active_verifier,
+                rollback_window_end: state.rollback_window_end,
+            }
+            .publish(env);
+        }
+        7 => {
+            // RollbackVerifierRotation
+            let state = get_verifier_rotation_state(env);
+            let active_verifier = state
+                .active_verifier
+                .clone()
+                .unwrap_or_else(|| panic_with_error!(env, RegistryError::RotationNotScheduled));
+            let previous_verifier = state
+                .previous_verifier
+                .clone()
+                .unwrap_or_else(|| panic_with_error!(env, RegistryError::RotationNotScheduled));
+
+            env.storage()
+                .persistent()
+                .set(&DataKey::Verifier, &previous_verifier);
+            env.storage().persistent().remove(&DataKey::VerifierState);
+            env.storage()
+                .persistent()
+                .remove(&DataKey::VerifierCircuitVersions);
+            VerifierRotationRolledBack {
+                active_verifier: previous_verifier.clone(),
+                previous_verifier: active_verifier,
+            }
+            .publish(env);
         }
         _ => panic_with_error!(env, RegistryError::InvalidProposalAction),
     }
@@ -4246,8 +9650,216 @@ fn u32_from_be_bytes(bytes: &[u8; 32]) -> u32 {
     u32::from_be_bytes([bytes[28], bytes[29], bytes[30], bytes[31]])
 }
 
+fn preflight_accept(
+    tier: u32,
+    circuit_version: u32,
+    envelope_version: u32,
+) -> StatementPreflightResult {
+    StatementPreflightResult {
+        preflight_accepted: true,
+        cryptographically_verified: false,
+        proof_stored: false,
+        requires_crypto_verify: true,
+        stage: PreflightStage::StructureAndPolicyOnly,
+        registry_error_code: 0,
+        codec_reject_code: verifier_inputs::ACCEPTED_CODE,
+        tier,
+        circuit_version,
+        envelope_version,
+    }
+}
+
+fn preflight_reject(
+    tier: u32,
+    circuit_version: u32,
+    envelope_version: u32,
+    registry_error_code: u32,
+    codec_reject_code: u32,
+) -> StatementPreflightResult {
+    StatementPreflightResult {
+        preflight_accepted: false,
+        cryptographically_verified: false,
+        proof_stored: false,
+        requires_crypto_verify: true,
+        stage: PreflightStage::StructureAndPolicyOnly,
+        registry_error_code,
+        codec_reject_code,
+        tier,
+        circuit_version,
+        envelope_version,
+    }
+}
+
+fn map_codec_reject_to_registry_error(code: verifier_inputs::RejectCode) -> RegistryError {
+    match code {
+        verifier_inputs::RejectCode::MalformedHex | verifier_inputs::RejectCode::Length => {
+            RegistryError::InvalidPublicInputs
+        }
+        verifier_inputs::RejectCode::Padding
+        | verifier_inputs::RejectCode::NonCanonicalField
+        | verifier_inputs::RejectCode::ZeroField
+        | verifier_inputs::RejectCode::UnknownSchema => RegistryError::InvalidPublicInputs,
+        verifier_inputs::RejectCode::DomainMismatch => RegistryError::DomainTagMismatch,
+        verifier_inputs::RejectCode::VersionMismatch => RegistryError::CircuitVersionMismatch,
+        verifier_inputs::RejectCode::ProofUndersize | verifier_inputs::RejectCode::ProofOversize => {
+            RegistryError::InvalidProof
+        }
+    }
+}
+
+fn check_preflight_envelope(
+    env: &Env,
+    version: u32,
+    metadata_hash: &BytesN<32>,
+) -> Result<(), RegistryError> {
+    if version < METADATA_ENVELOPE_V1 || version > METADATA_ENVELOPE_VERSION_MAX {
+        return Err(RegistryError::UnsupportedMetadataEnvelopeVersion);
+    }
+    let zero = BytesN::from_array(env, &[0u8; 32]);
+    if version > METADATA_ENVELOPE_V1 && *metadata_hash == zero {
+        return Err(RegistryError::InvalidMetadataEnvelope);
+    }
+    Ok(())
+}
+
+fn check_preflight_unique(
+    env: &Env,
+    proof_id: &BytesN<32>,
+    video_hash: &BytesN<32>,
+) -> Result<(), RegistryError> {
+    if env
+        .storage()
+        .persistent()
+        .has(&DataKey::Proof(proof_id.clone()))
+    {
+        return Err(RegistryError::DuplicateProof);
+    }
+    if env
+        .storage()
+        .persistent()
+        .has(&DataKey::Video(video_hash.clone()))
+    {
+        return Err(RegistryError::DuplicateVideo);
+    }
+    Ok(())
+}
+
+fn check_active_credential_root(
+    env: &Env,
+    credential_root: &BytesN<32>,
+) -> Result<(), RegistryError> {
+    let Some(record) = get_credential_root_record_opt(env, credential_root) else {
+        return Err(RegistryError::UnknownCredentialRoot);
+    };
+    if record.status == STATUS_REVOKED {
+        return Err(RegistryError::RevokedCredentialRoot);
+    }
+    if record.status == STATUS_EXPIRED
+        || (record.expires_at > 0 && env.ledger().timestamp() >= record.expires_at)
+    {
+        return Err(RegistryError::ExpiredCredentialRoot);
+    }
+    Ok(())
+}
+
+fn check_issuer_quota_available(env: &Env, subject: &Address) -> Result<(), RegistryError> {
+    let quota_key = DataKey::IssuerQuota(subject.clone());
+    let quota: Option<IssuerQuotaRecord> = env.storage().persistent().get(&quota_key);
+    let Some(quota) = quota else {
+        return Ok(());
+    };
+    if quota.max_registrations == 0 || quota.window_secs == 0 {
+        return Ok(());
+    }
+
+    let bucket = issuer_quota_bucket(env, quota.window_secs);
+    let usage_key = DataKey::IssuerQuotaUsage(subject.clone());
+    let stored: Option<IssuerQuotaUsage> = env.storage().persistent().get(&usage_key);
+    let usage = match stored {
+        Some(usage) if usage.bucket == bucket => usage,
+        _ => IssuerQuotaUsage { bucket, count: 0 },
+    };
+
+    if usage.count >= quota.max_registrations {
+        return Err(RegistryError::IssuerQuotaExhausted);
+    }
+
+    Ok(())
+}
+
+fn check_supported_circuit_version(
+    ctx: &VerifierContext,
+    circuit_version: u32,
+) -> Result<(), RegistryError> {
+    if circuit_version < MIN_SUPPORTED_CIRCUIT_VERSION
+        || circuit_version > MAX_SUPPORTED_CIRCUIT_VERSION
+    {
+        return Err(RegistryError::UnsupportedCircuitVersion);
+    }
+    let (min_v, max_v) = ctx.circuit_versions;
+    if circuit_version < min_v || circuit_version > max_v {
+        return Err(RegistryError::UnsupportedCircuitVersion);
+    }
+    Ok(())
+}
+
+/// Test-only helpers for reading contract events.
+///
+/// `env.events().all()` only reflects the most recent invocation, so callers
+/// must capture events immediately after the call under test.
+#[cfg(test)]
+pub(crate) mod event_test_utils {
+    use crate::Env;
+    use soroban_sdk::testutils::Events as _;
+    use soroban_sdk::xdr::{ContractEventBody, ScVal};
+    use std::format;
+    use std::string::String;
+    use std::vec::Vec;
+
+    /// Symbolic topics of one XDR contract event, in order. Non-symbol topics
+    /// are skipped.
+    pub fn symbol_topics(event: &soroban_sdk::xdr::ContractEvent) -> Vec<String> {
+        let mut out = Vec::new();
+        let ContractEventBody::V0(v0) = &event.body;
+        {
+            for topic in v0.topics.iter() {
+                if let ScVal::Symbol(s) = topic {
+                    out.push(format!("{}", s.0));
+                }
+            }
+        }
+        out
+    }
+
+    /// Number of events from the most recent invocation whose leading symbol
+    /// topics equal `prefix`.
+    pub fn count_events(env: &Env, prefix: &[&str]) -> u32 {
+        let mut count = 0u32;
+        for event in env.events().all().events() {
+            let topics = symbol_topics(event);
+            if topics.len() >= prefix.len()
+                && topics
+                    .iter()
+                    .zip(prefix.iter())
+                    .all(|(t, p)| t.as_str() == *p)
+            {
+                count = count.saturating_add(1);
+            }
+        }
+        count
+    }
+
+    /// True when the most recent invocation emitted at least one event whose
+    /// leading symbol topics equal `prefix`.
+    pub fn has_event(env: &Env, prefix: &[&str]) -> bool {
+        count_events(env, prefix) > 0
+    }
+}
+
 #[cfg(test)]
 mod test;
+#[cfg(test)]
+mod test_aggregation;
 #[cfg(test)]
 mod test_auth;
 #[cfg(test)]
@@ -4257,34 +9869,68 @@ mod test_conformance;
 #[cfg(test)]
 mod test_delegation;
 #[cfg(test)]
+mod test_deployment_fixture;
+#[cfg(test)]
+mod test_dispute;
+#[cfg(test)]
+mod test_error_abi;
+#[cfg(test)]
 mod test_expiry;
 #[cfg(test)]
 mod test_fuzz;
 #[cfg(test)]
-mod test_invariants;
-#[cfg(test)]
 mod test_identity_tier_properties;
 #[cfg(test)]
-mod test_pause;
+mod test_invariants;
 #[cfg(test)]
-mod test_revocation;
+mod test_issuer_quota;
 #[cfg(test)]
-mod test_registration_replay;
+mod test_issuer_rotation;
 #[cfg(test)]
-mod test_scoped_nullifier;
+mod test_lifecycle;
 #[cfg(test)]
-mod test_state_machine;
-#[cfg(test)]
-mod test_dispute;
-#[cfg(test)]
-pub mod test_timelock;
-#[cfg(test)]
-mod test_schema;
-#[cfg(test)]
-mod test_selective_disclosure;
-#[cfg(test)]
-mod test_upgrade_compat;
+mod test_lineage;
 #[cfg(test)]
 mod test_metadata_envelope;
 #[cfg(test)]
-mod test_deployment_fixture;
+mod test_pause;
+#[cfg(test)]
+mod test_proof_status_details;
+#[cfg(test)]
+mod test_receipt;
+#[cfg(test)]
+mod test_registration_replay;
+#[cfg(test)]
+mod test_revocation;
+#[cfg(test)]
+mod test_roles;
+#[cfg(test)]
+mod test_schema;
+#[cfg(test)]
+mod test_scoped_nullifier;
+#[cfg(test)]
+mod test_selective_disclosure;
+#[cfg(test)]
+mod test_state_machine;
+#[cfg(test)]
+pub mod test_timelock;
+#[cfg(test)]
+mod test_threshold_seal;
+#[cfg(test)]
+mod test_timestamp_claim;
+#[cfg(test)]
+mod test_upgrade_compat;
+#[cfg(test)]
+mod test_verifier_versions;
+#[cfg(test)]
+mod test_ttl;
+#[cfg(test)]
+mod test_list_credential_roots;
+#[cfg(test)]
+mod test_uninitialized;
+#[cfg(test)]
+mod test_preflight;
+
+
+#[cfg(test)]
+mod test_events_conformance;
